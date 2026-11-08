@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test logica</title>
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; background: #111; color: #eee; padding: 16px; }
+  .ok { color: #6ee7a0; } .ko { color: #ff7a7a; }
+  li { margin: 4px 0; } small { color: #aaa; display: block; }
+</style>
+</head>
+<body>
+<h1 id="sum">Esecuzione test…</h1>
+<ul id="list"></ul>
+<script type="module">
+  import results from './logic.test.js';
+  const failed = results.filter(r => !r.ok);
+  document.getElementById('sum').textContent =
+    `${results.length - failed.length}/${results.length} test superati`;
+  document.getElementById('sum').className = failed.length ? 'ko' : 'ok';
+  document.getElementById('list').innerHTML = results.map(r =>
+    `<li class="${r.ok ? 'ok' : 'ko'}">${r.ok ? '✔' : '✘'} ${r.name}${r.err ? `<small>${r.err}</small>` : ''}</li>`).join('');
+  window.__testResults = results;
+</script>
+</body>
+</html>
