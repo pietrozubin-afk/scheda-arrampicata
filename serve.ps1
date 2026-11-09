@@ -18,22 +18,31 @@ Write-Host "Server avviato su http://localhost:$Port/ (Ctrl+C per fermare)"
 try {
   while ($listener.IsListening) {
     $ctx = $listener.GetContext()
-    $path = [Uri]::UnescapeDataString($ctx.Request.Url.AbsolutePath).TrimStart('/')
-    if ($path -eq '' -or $path.EndsWith('/')) { $path += 'index.html' }
-    $file = [System.IO.Path]::GetFullPath((Join-Path $root $path))
     $res = $ctx.Response
-    # Nessuna cache, così durante lo sviluppo si vede sempre l'ultima versione
-    $res.Headers.Add('Cache-Control', 'no-store')
-    if ($file.StartsWith($root) -and (Test-Path $file -PathType Leaf)) {
-      $ext = [System.IO.Path]::GetExtension($file).ToLower()
-      $res.ContentType = if ($types.ContainsKey($ext)) { $types[$ext] } else { 'application/octet-stream' }
-      $bytes = [System.IO.File]::ReadAllBytes($file)
-      $res.ContentLength64 = $bytes.Length
-      $res.OutputStream.Write($bytes, 0, $bytes.Length)
-    } else {
-      $res.StatusCode = 404
+    # Un errore su una singola richiesta non deve fermare il server
+    try {
+      $path = [Uri]::UnescapeDataString($ctx.Request.Url.AbsolutePath).TrimStart('/')
+      if ($path -eq '' -or $path.EndsWith('/')) { $path += 'index.html' }
+      $file = [System.IO.Path]::GetFullPath((Join-Path $root $path))
+      # Nessuna cache, così durante lo sviluppo si vede sempre l'ultima versione
+      $res.Headers.Add('Cache-Control', 'no-store')
+      if ($file.StartsWith($root) -and (Test-Path $file -PathType Leaf)) {
+        $ext = [System.IO.Path]::GetExtension($file).ToLower()
+        $res.ContentType = if ($types.ContainsKey($ext)) { $types[$ext] } else { 'application/octet-stream' }
+        $bytes = [System.IO.File]::ReadAllBytes($file)
+        if ($ctx.Request.HttpMethod -eq 'HEAD') {
+          $res.ContentLength64 = $bytes.Length
+        } else {
+          $res.OutputStream.Write($bytes, 0, $bytes.Length)
+        }
+      } else {
+        $res.StatusCode = 404
+      }
+    } catch {
+      Write-Host "Errore su $($ctx.Request.Url): $_"
+    } finally {
+      try { $res.Close() } catch { }
     }
-    $res.Close()
   }
 } finally {
   $listener.Stop()

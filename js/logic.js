@@ -27,9 +27,20 @@ export function defaultSettings() {
     grip: 'Half crimp',
     addedKg: 0,              // >0 zavorra, <0 alleggerimento (elastico/carrucola)
     rpeTarget: 8,
-    // Boulder
+    // Boulder (sessione di scarico / sessioni non classificate)
     boulderMin: 30,
-    boulderLimitMin: 15,     // primi minuti dedicati ai blocchi al limite
+    boulderLimitMin: 15,     // primi minuti dedicati ai blocchi al limite (solo sessioni vecchie)
+    // Sessione A – Limite
+    hangRepsA: 3,            // hangboard ridotto
+    boulderAMin: 35,         // boulder al limite 30–40 min
+    attemptRestSec: 180,     // recupero tra tentativi 3–4 min
+    projectLevel: 5,         // livello dei progetti (scala palestra 1–7)
+    // Sessione B – Volume (hangReps sopra = 5 sospensioni)
+    boulderBMin: 30,
+    volumeRestSec: 90,       // recupero tra blocchi 1–2 min
+    volumeTargetMin: 12,     // obiettivo 12–20 blocchi
+    volumeTargetMax: 20,
+    volumeLevel: 4,          // livello dei blocchi a volume
     // Corpo libero
     bwRounds: 3,
     bwRoundRestSec: 90,      // recupero tra un giro e l'altro
@@ -56,10 +67,67 @@ export const BW_EXERCISES = [
 
 export const WARMUP_MOBILITY = ['Mobilità spalle', 'Mobilità polsi e dita'];
 
+// ---------------------------------------------------------------------
+// TIPI DI SESSIONE
+//   A = Limite (hangboard ridotto + progetti)
+//   B = Volume (hangboard completo + tanti blocchi)
+//   S = Scarico (niente hangboard, boulder facile)
+//   U = Non classificata (sessioni salvate prima dell'introduzione di A/B)
+// ---------------------------------------------------------------------
+export const SESSION_TYPES = {
+  A: { id: 'A', name: 'Sessione A', short: 'A · Limite', desc: 'Limite' },
+  B: { id: 'B', name: 'Sessione B', short: 'B · Volume', desc: 'Volume' },
+  S: { id: 'S', name: 'Scarico', short: 'Scarico', desc: 'Scarico' },
+  U: { id: 'U', name: 'Non classificata', short: 'Non classificata', desc: '' },
+};
+
+export const STYLES = ['Strapiombo', 'Placca', 'Verticale', 'Tetto', 'Diedro', 'Spigolo'];
+export const OUTCOMES = {
+  sent: 'Chiuso',
+  sections: 'Sezioni chiuse',
+  notSent: 'Non chiuso',
+};
+
+export const LEVEL_MIN = 1;
+export const LEVEL_MAX = 7;
+export const clampLevel = l => Math.min(LEVEL_MAX, Math.max(LEVEL_MIN, Math.round(Number(l) || LEVEL_MIN)));
+
+// Alternanza: propone il tipo opposto all'ultima sessione A o B.
+// Scarico e non classificate non contano. Prima volta in assoluto: A.
+export function suggestType(state) {
+  for (let i = state.sessions.length - 1; i >= 0; i--) {
+    const t = state.sessions[i].type;
+    if (t === 'A') return 'B';
+    if (t === 'B') return 'A';
+  }
+  return 'A';
+}
+
+// Voci della checklist di riscaldamento (in A si aggiunge 1–2 blocchi al livello volume).
+export function warmupItems(settings, type) {
+  const items = [...WARMUP_MOBILITY];
+  for (let i = 0; i < settings.warmupBlocks; i++) items.push(`Blocco facile ${i + 1}`);
+  if (type === 'A') items.push(`1–2 blocchi di livello ${settings.volumeLevel}`);
+  return items;
+}
+
+export function hangRepsFor(settings, type) {
+  if (type === 'S') return 0;
+  return type === 'A' ? settings.hangRepsA : settings.hangReps;
+}
+
+export function boulderMinFor(settings, type) {
+  if (type === 'A') return settings.boulderAMin;
+  if (type === 'B') return settings.boulderBMin;
+  return settings.boulderMin;
+}
+
 // Stato iniziale dell'app al primo avvio.
+export const STATE_VERSION = 2;
+
 export function initialState(now) {
   return {
-    version: 1,
+    version: STATE_VERSION,
     programStart: now,
     settings: defaultSettings(),
     sessions: [],
@@ -74,7 +142,7 @@ export function initialState(now) {
 export function normalizeState(raw, now) {
   const base = initialState(now);
   if (!raw || typeof raw !== 'object') return base;
-  return {
+  const merged = {
     ...base,
     ...raw,
     settings: { ...base.settings, ...(raw.settings || {}) },
@@ -82,6 +150,48 @@ export function normalizeState(raw, now) {
     deload: { ...base.deload, ...(raw.deload || {}) },
     sessions: Array.isArray(raw.sessions) ? raw.sessions : [],
     events: Array.isArray(raw.events) ? raw.events : [],
+  };
+  return migrateState(merged);
+}
+
+// ---------------------------------------------------------------------
+// MIGRAZIONE DEI DATI SALVATI
+// v1 -> v2: introduzione dei tipi di sessione A/B.
+//   - le sessioni esistenti diventano "non classificate" (U),
+//     quelle fatte in settimana di scarico diventano "Scarico" (S);
+//   - il boulder riceve i nuovi campi (progetti e registro volume) vuoti.
+// Nessun dato esistente viene cancellato o modificato.
+// ---------------------------------------------------------------------
+export function migrateSession(s) {
+  if (!s || typeof s !== 'object') return s;
+  const type = SESSION_TYPES[s.type] ? s.type : (s.deload ? 'S' : 'U');
+  const boulder = s.boulder || { elapsedMs: 0, notes: '' };
+  return {
+    ...s,
+    type,
+    boulder: {
+      ...boulder,
+      projects: Array.isArray(boulder.projects) ? boulder.projects : [],
+      log: Array.isArray(boulder.log) ? boulder.log : [],
+    },
+  };
+}
+
+export function migrateState(st) {
+  const from = Number(st.version) || 1;
+  if (from >= STATE_VERSION && st.sessions.every(s => SESSION_TYPES[s.type])) return st;
+  return { ...st, version: STATE_VERSION, sessions: st.sessions.map(migrateSession) };
+}
+
+// Sessione in corso salvata da una versione precedente dell'app.
+export function migrateRun(run) {
+  if (!run || !run.session) return run;
+  return {
+    rest: null,
+    projIdx: 0,
+    volLevel: null,
+    ...run,
+    session: migrateSession(run.session),
   };
 }
 
@@ -146,18 +256,33 @@ export function formatClock(ms) {
 //   auto: true  -> allo scadere del timer si passa da soli al passo successivo
 //   auto: false -> il timer è indicativo, si avanza con un tap
 // ---------------------------------------------------------------------
-export function buildSteps(settings, { deload = false } = {}) {
+// Tipo effettivo: accetta anche il vecchio parametro { deload: true }.
+function resolveType({ type, deload } = {}) {
+  if (deload) return 'S';
+  return SESSION_TYPES[type] ? type : 'B';
+}
+
+// Modalità del boulder: progetti (A), volume (B), libero (scarico/non classificata).
+export function boulderMode(type) {
+  if (type === 'A') return 'project';
+  if (type === 'B') return 'volume';
+  return 'free';
+}
+
+export function buildSteps(settings, opts = {}) {
   const s = settings;
+  const type = resolveType(opts);
   const steps = [];
   steps.push({ kind: 'warmup', durationMs: s.warmupMin * MIN, auto: false });
 
-  if (!deload) {
+  const reps = hangRepsFor(s, type);
+  if (reps > 0) {
     steps.push({ kind: 'hangConfirm' });
     steps.push({ kind: 'hangSetup' });
-    for (let rep = 0; rep < s.hangReps; rep++) {
+    for (let rep = 0; rep < reps; rep++) {
       steps.push({ kind: 'hangCountdown', rep, durationMs: s.countdownSec * SEC, auto: true });
       steps.push({ kind: 'hang', rep, durationMs: s.hangSec * SEC, auto: true });
-      const last = rep === s.hangReps - 1;
+      const last = rep === reps - 1;
       // Dopo l'ultima sospensione non serve recupero: resta solo la registrazione dell'RPE.
       steps.push(last
         ? { kind: 'hangRest', rep, last: true }
@@ -165,7 +290,7 @@ export function buildSteps(settings, { deload = false } = {}) {
     }
   }
 
-  steps.push({ kind: 'boulder', durationMs: s.boulderMin * MIN, auto: false });
+  steps.push({ kind: 'boulder', mode: boulderMode(type), durationMs: boulderMinFor(s, type) * MIN, auto: false });
 
   for (let round = 0; round < s.bwRounds; round++) {
     BW_EXERCISES.forEach((ex, i) => steps.push({ kind: 'bw', round, exIndex: i }));
@@ -196,13 +321,19 @@ export function lastSession(state, pred = () => true) {
   return null;
 }
 
-export function newSession(state, now, { deload = false } = {}) {
+export function newProject(settings) {
+  return { level: settings.projectLevel, style: '', attempts: 0, outcome: null, notes: '' };
+}
+
+export function newSession(state, now, opts = {}) {
   const s = state.settings;
+  const type = resolveType(opts);
+  const deload = type === 'S';
   const prevHang = lastSession(state, x => x.hang && !x.hang.skipped && x.hang.reps.length);
   const prevBw = lastSession(state, x => x.bodyweight && x.bodyweight.rounds.length);
 
   const hangReps = [];
-  for (let i = 0; i < s.hangReps; i++) {
+  for (let i = 0; i < hangRepsFor(s, type); i++) {
     const prevRpe = prevHang?.hang.reps[i]?.rpe;
     hangReps.push({ targetS: s.hangSec, heldS: null, rpe: prevRpe ?? s.rpeTarget, done: false });
   }
@@ -220,11 +351,12 @@ export function newSession(state, now, { deload = false } = {}) {
 
   return {
     id: `s${now}`,
+    type,
     date: now,
     endedAt: null,
     deload,
     pain: false,
-    warmup: { done: false, checks: Array(WARMUP_MOBILITY.length + s.warmupBlocks).fill(false) },
+    warmup: { done: false, checks: Array(warmupItems(s, type).length).fill(false) },
     hang: deload ? null : {
       edgeMm: s.edgeMm,
       grip: s.grip,
@@ -234,9 +366,85 @@ export function newSession(state, now, { deload = false } = {}) {
       interrupted: null,
       skipped: false,
     },
-    boulder: { elapsedMs: 0, notes: '' },
+    boulder: {
+      elapsedMs: 0,
+      notes: '',
+      projects: type === 'A' ? [newProject(s)] : [],
+      log: [],                // volume B: [{ ts, level, sent }]
+    },
     bodyweight: { rounds },
   };
+}
+
+// "Salta hangboard oggi": la sessione resta valida, l'evento va nello storico.
+export function skipHangboard(state, session, now) {
+  if (!session.hang) return state;
+  session.hang.skipped = true;
+  session.hang.skipReason = 'saltato per scelta';
+  const name = SESSION_TYPES[session.type]?.name || 'Sessione';
+  return { ...state, events: [...state.events, { ts: now, type: 'skip', text: `Hangboard saltato (${name})` }] };
+}
+
+// ---------------------------------------------------------------------
+// BOULDER A – progetti
+// ---------------------------------------------------------------------
+export function addAttempt(project, delta = 1) {
+  project.attempts = Math.max(0, (project.attempts || 0) + delta);
+  return project.attempts;
+}
+
+export function projectStats(session) {
+  const projects = session?.boulder?.projects || [];
+  return {
+    projects: projects.length,
+    attempts: projects.reduce((a, p) => a + (p.attempts || 0), 0),
+    sends: projects.filter(p => p.outcome === 'sent').length,
+    sections: projects.filter(p => p.outcome === 'sections').length,
+  };
+}
+
+// ---------------------------------------------------------------------
+// BOULDER B – contatore volume
+// ---------------------------------------------------------------------
+export function volumeAdd(boulder, level, sent, ts) {
+  boulder.log.push({ ts, level: clampLevel(level), sent: !!sent });
+  return boulder;
+}
+
+export function volumeUndo(boulder) {
+  boulder.log.pop();
+  return boulder;
+}
+
+export function volumeStats(session) {
+  const log = session?.boulder?.log || [];
+  const byLevel = {};
+  let sent = 0;
+  for (const e of log) {
+    byLevel[e.level] ??= { sent: 0, notSent: 0 };
+    if (e.sent) { byLevel[e.level].sent++; sent++; } else byLevel[e.level].notSent++;
+  }
+  return { total: log.length, sent, notSent: log.length - sent, byLevel };
+}
+
+// Avanzamento verso l'obiettivo 12–20 blocchi (contano tutti i blocchi provati).
+export function volumeProgress(session, settings) {
+  const { total } = volumeStats(session);
+  return {
+    total,
+    reachedMin: total >= settings.volumeTargetMin,
+    reachedMax: total >= settings.volumeTargetMax,
+    pct: Math.min(100, Math.round((100 * total) / settings.volumeTargetMax)),
+  };
+}
+
+// ---------------------------------------------------------------------
+// TIMER DI RECUPERO del boulder: dopo un tentativo (A) o un blocco (B).
+// È un timer secondario, indipendente da quello della fase boulder.
+// ---------------------------------------------------------------------
+export function restTimerFor(settings, type, now) {
+  const sec = type === 'A' ? settings.attemptRestSec : settings.volumeRestSec;
+  return createTimer(sec * SEC, now);
 }
 
 // Statistiche hangboard di una sessione (per storico e progressione).
@@ -296,9 +504,10 @@ export function progressionSuggestion(state, now) {
   // Un dolore alle dita dopo l'ultimo cambio blocca la progressione.
   if (state.events.some(e => e.type === 'pain' && e.ts >= since)) return null;
 
-  // Sessioni valide: dopo l'ultimo cambio, con la configurazione attuale.
+  // Sessioni valide: A e B (e le vecchie non classificate) dopo l'ultimo cambio,
+  // con la configurazione attuale. Le sessioni A con hangboard saltato non contano.
   const relevant = state.sessions.filter(x =>
-    x.date >= since && !x.deload && !x.pain && x.hang && !x.hang.skipped &&
+    x.date >= since && !x.deload && x.type !== 'S' && !x.pain && x.hang && !x.hang.skipped &&
     x.hang.edgeMm === s.edgeMm && x.hang.addedKg === s.addedKg && hangStats(x));
   if (relevant.length < s.progressionMinSessions) return null;
 
@@ -410,29 +619,45 @@ function isoDate(ts) {
 
 // Una riga per ogni serie registrata.
 export function toCSV(state) {
-  const header = ['data', 'sessione', 'sezione', 'esercizio', 'serie', 'valore', 'unita', 'carico_kg', 'tacca_mm', 'rpe', 'note'];
+  const header = ['data', 'sessione', 'tipo', 'sezione', 'esercizio', 'serie', 'valore', 'unita', 'carico_kg', 'tacca_mm', 'rpe', 'note'];
   const rows = [header];
-  for (const s of state.sessions) {
+  for (const raw of state.sessions) {
+    const s = migrateSession(raw);
     const d = isoDate(s.date);
-    if (s.warmup) rows.push([d, s.id, 'riscaldamento', 'riscaldamento', '', s.warmup.done ? 1 : 0, 'completato', '', '', '', '']);
+    const r0 = (...cols) => rows.push([d, s.id, s.type, ...cols]);
+    if (s.warmup) r0('riscaldamento', 'riscaldamento', '', s.warmup.done ? 1 : 0, 'completato', '', '', '', '');
+    if (s.hang && s.hang.skipped) r0('hangboard', 'hangboard', '', 0, 'saltato', '', '', '', s.hang.skipReason || '');
     if (s.hang && !s.hang.skipped) {
       s.hang.reps.forEach((r, i) => {
         if (!r.done) return;
-        rows.push([d, s.id, 'hangboard', `max hang ${s.hang.grip}`, i + 1, r.heldS ?? r.targetS, 's',
-          round1(s.hang.bodyKg + s.hang.addedKg), s.hang.edgeMm, r.rpe, s.hang.interrupted ? 'interrotto: dolore' : '']);
+        r0('hangboard', `max hang ${s.hang.grip}`, i + 1, r.heldS ?? r.targetS, 's',
+          round1(s.hang.bodyKg + s.hang.addedKg), s.hang.edgeMm, r.rpe, s.hang.interrupted ? 'interrotto: dolore' : '');
       });
     }
-    if (s.boulder) rows.push([d, s.id, 'boulder', 'boulder libero', '', Math.round((s.boulder.elapsedMs || 0) / MIN), 'min', '', '', '', s.boulder.notes]);
+    if (s.boulder) {
+      const mode = boulderMode(s.type);
+      r0('boulder', mode === 'project' ? 'boulder al limite' : mode === 'volume' ? 'boulder a volume' : 'boulder libero',
+        '', Math.round((s.boulder.elapsedMs || 0) / MIN), 'min', '', '', '', s.boulder.notes);
+      s.boulder.projects.forEach((p, i) => {
+        const note = [p.outcome ? OUTCOMES[p.outcome] : 'esito non indicato', p.style, p.notes].filter(Boolean).join(' · ');
+        r0('boulder progetto', `progetto ${i + 1} livello ${p.level}`, i + 1, p.attempts, 'tentativi', '', '', '', note);
+      });
+      const vs = volumeStats(s);
+      Object.keys(vs.byLevel).sort().forEach(level => {
+        r0('boulder volume', `livello ${level}`, '', vs.byLevel[level].sent, 'chiusi', '', '', '', '');
+        r0('boulder volume', `livello ${level}`, '', vs.byLevel[level].notSent, 'non chiusi', '', '', '', '');
+      });
+    }
     (s.bodyweight?.rounds || []).forEach((round, ri) => {
       round.forEach(e => {
         if (!e.done) return;
         const ex = BW_EXERCISES.find(x => x.id === e.id);
-        rows.push([d, s.id, 'corpo libero', ex?.name ?? e.id, ri + 1, e.value, ex?.unit ?? '', e.loadKg || '', '', '', '']);
+        r0('corpo libero', ex?.name ?? e.id, ri + 1, e.value, ex?.unit ?? '', e.loadKg || '', '', '', '');
       });
     });
   }
   for (const e of state.events) {
-    rows.push([isoDate(e.ts), '', 'evento', e.type, '', '', '', '', '', '', e.text]);
+    rows.push([isoDate(e.ts), '', '', 'evento', e.type, '', '', '', '', '', '', e.text]);
   }
   return rows.map(r => r.map(csvCell).join(',')).join('\n');
 }

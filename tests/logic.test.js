@@ -300,9 +300,285 @@ test('CSV: una riga per serie, con intestazione', () => {
   s.boulder.notes = 'chiuso 6b, "tetto"';
   st = withSessions(st, [s]);
   const lines = L.toCSV(st).split('\n');
-  ok(lines[0].startsWith('data,sessione,sezione'));
+  ok(lines[0].startsWith('data,sessione,tipo,sezione'));
   eq(lines.filter(l => l.includes(',hangboard,')).length, 5);
   ok(lines.some(l => l.includes('"chiuso 6b, ""tetto"""')), 'virgolette e virgole escapate');
+});
+
+test('CSV: include tipo di sessione, progetti e volume', () => {
+  let st = L.initialState(T0);
+  const a = L.newSession(st, T0 + L.DAY, { type: 'A' });
+  a.boulder.projects[0] = { level: 5, style: 'Placca', attempts: 4, outcome: 'sent', notes: '' };
+  const b = L.newSession(st, T0 + 2 * L.DAY, { type: 'B' });
+  L.volumeAdd(b.boulder, 4, true, 1); L.volumeAdd(b.boulder, 4, false, 2); L.volumeAdd(b.boulder, 3, true, 3);
+  st = withSessions(st, [a, b]);
+  const lines = L.toCSV(st).split('\n');
+  ok(lines[0].includes(',tipo,'), 'colonna tipo');
+  ok(lines.some(l => l.includes(',A,boulder progetto,') && l.includes(',4,tentativi,') && l.includes('Chiuso · Placca')));
+  ok(lines.some(l => l.includes(',B,boulder volume,livello 4,,1,chiusi')));
+  ok(lines.some(l => l.includes(',B,boulder volume,livello 4,,1,non chiusi')));
+  ok(lines.some(l => l.includes(',B,boulder volume,livello 3,,1,chiusi')));
+});
+
+// ============================ SESSIONI A / B ============================
+test('alternanza: prima sessione in assoluto -> A', () => {
+  eq(L.suggestType(L.initialState(T0)), 'A');
+});
+
+test('alternanza: dopo A propone B e dopo B propone A', () => {
+  let st = L.initialState(T0);
+  st = withSessions(st, [L.newSession(st, T0 + L.DAY, { type: 'A' })]);
+  eq(L.suggestType(st), 'B');
+  st = withSessions(st, [L.newSession(st, T0 + 2 * L.DAY, { type: 'B' })]);
+  eq(L.suggestType(st), 'A');
+});
+
+test('alternanza: scarico e non classificate non contano', () => {
+  let st = L.initialState(T0);
+  st = withSessions(st, [L.newSession(st, T0 + L.DAY, { type: 'B' })]);
+  st = withSessions(st, [L.newSession(st, T0 + 2 * L.DAY, { type: 'S' })]);
+  st = withSessions(st, [{ ...L.newSession(st, T0 + 3 * L.DAY), type: 'U' }]);
+  eq(L.suggestType(st), 'A', 'riferimento: ultima B');
+});
+
+test('piano A: 3 sospensioni, boulder progetti 35 min', () => {
+  const s = L.defaultSettings();
+  const steps = L.buildSteps(s, { type: 'A' });
+  eq(steps.filter(x => x.kind === 'hang').length, 3);
+  eq(steps.filter(x => x.kind === 'hangRest' && x.last).length, 1);
+  const b = steps.find(x => x.kind === 'boulder');
+  eq(b.mode, 'project');
+  eq(b.durationMs, 35 * L.MIN);
+  eq(steps.filter(x => x.kind === 'bw').length, 12, 'corpo libero identico');
+});
+
+test('piano B: 5 sospensioni, boulder volume 30 min', () => {
+  const steps = L.buildSteps(L.defaultSettings(), { type: 'B' });
+  eq(steps.filter(x => x.kind === 'hang').length, 5);
+  const b = steps.find(x => x.kind === 'boulder');
+  eq(b.mode, 'volume');
+  eq(b.durationMs, 30 * L.MIN);
+});
+
+test('riscaldamento A con voce finale "1–2 blocchi di livello 4"', () => {
+  const s = L.defaultSettings();
+  const a = L.warmupItems(s, 'A');
+  const b = L.warmupItems(s, 'B');
+  eq(a.length, b.length + 1);
+  eq(a.at(-1), '1–2 blocchi di livello 4');
+  const st = L.initialState(T0);
+  eq(L.newSession(st, T0, { type: 'A' }).warmup.checks.length, a.length);
+  eq(L.newSession({ ...st, settings: { ...s, volumeLevel: 5 } }, T0, { type: 'A' }).warmup.checks.length, a.length);
+  eq(L.warmupItems({ ...s, volumeLevel: 5 }, 'A').at(-1), '1–2 blocchi di livello 5', 'segue il livello volume');
+});
+
+test('nuova sessione A: 3 sospensioni e un progetto al livello progetto', () => {
+  const st = L.initialState(T0);
+  st.settings.projectLevel = 6;
+  const s = L.newSession(st, T0, { type: 'A' });
+  eq(s.type, 'A');
+  eq(s.hang.reps.length, 3);
+  eq(s.boulder.projects.length, 1);
+  eq(s.boulder.projects[0].level, 6);
+  eq(s.boulder.log, []);
+});
+
+test('nuova sessione di scarico: niente hangboard, tipo S', () => {
+  const s = L.newSession(L.initialState(T0), T0, { type: 'S' });
+  eq(s.type, 'S');
+  eq(s.hang, null);
+  eq(s.deload, true);
+});
+
+test('A: tentativi e chiusure dei progetti', () => {
+  const s = L.newSession(L.initialState(T0), T0, { type: 'A' });
+  const p = s.boulder.projects[0];
+  L.addAttempt(p); L.addAttempt(p); L.addAttempt(p);
+  eq(p.attempts, 3);
+  L.addAttempt(p, -1);
+  eq(p.attempts, 2, 'correzione −1');
+  L.addAttempt(p, -5);
+  eq(p.attempts, 0, 'mai negativo');
+  p.attempts = 5; p.outcome = 'sent';
+  s.boulder.projects.push({ ...L.newProject(L.defaultSettings()), attempts: 4, outcome: 'sections' });
+  eq(L.projectStats(s), { projects: 2, attempts: 9, sends: 1, sections: 1 });
+});
+
+test('B: conteggio blocchi chiusi / non chiusi per livello', () => {
+  const s = L.newSession(L.initialState(T0), T0, { type: 'B' });
+  for (let i = 0; i < 9; i++) L.volumeAdd(s.boulder, 4, true, i);
+  L.volumeAdd(s.boulder, 4, false, 10);
+  L.volumeAdd(s.boulder, 3, true, 11);
+  L.volumeAdd(s.boulder, 5, false, 12);
+  const v = L.volumeStats(s);
+  eq(v.total, 12);
+  eq(v.sent, 10);
+  eq(v.notSent, 2);
+  eq(v.byLevel[4], { sent: 9, notSent: 1 });
+  eq(v.byLevel[3], { sent: 1, notSent: 0 });
+  eq(v.byLevel[5], { sent: 0, notSent: 1 });
+  const p = L.volumeProgress(s, L.defaultSettings());
+  ok(p.reachedMin && !p.reachedMax, '12 blocchi: obiettivo minimo raggiunto');
+  eq(p.pct, 60);
+});
+
+test('B: annulla ultimo blocco e livelli fuori scala', () => {
+  const s = L.newSession(L.initialState(T0), T0, { type: 'B' });
+  L.volumeAdd(s.boulder, 4, true, 1);
+  L.volumeAdd(s.boulder, 9, false, 2);
+  eq(s.boulder.log[1].level, 7, 'scala palestra 1–7');
+  L.volumeUndo(s.boulder);
+  eq(L.volumeStats(s).total, 1);
+  L.volumeUndo(s.boulder); L.volumeUndo(s.boulder);
+  eq(L.volumeStats(s).total, 0, 'annulla su registro vuoto non rompe');
+});
+
+test('timer recupero tentativi (A): 3 min di default, configurabile', () => {
+  const s = L.defaultSettings();
+  const t = L.restTimerFor(s, 'A', 1000);
+  eq(t.durationMs, 180000);
+  eq(L.timerRemaining(t, 61000), 120000);
+  ok(L.timerIsDone(t, 181000));
+  eq(L.restTimerFor({ ...s, attemptRestSec: 240 }, 'A', 0).durationMs, 240000);
+});
+
+test('timer recupero volume (B): 90 s di default', () => {
+  const t = L.restTimerFor(L.defaultSettings(), 'B', 0);
+  eq(t.durationMs, 90000);
+});
+
+test('timer recupero: nuovo tentativo riparte da capo, resta corretto in background', () => {
+  const s = L.defaultSettings();
+  let t = L.restTimerFor(s, 'A', 0);
+  t = L.restTimerFor(s, 'A', 100000); // nuovo tentativo a metà recupero
+  eq(L.timerRemaining(t, 100000), 180000);
+  eq(L.timerRemaining(t, 250000), 30000, 'nessun tick per 150 s: residuo giusto');
+  t = L.pauseTimer(t, 250000);
+  eq(L.timerRemaining(t, 999999), 30000);
+});
+
+test('salta hangboard oggi (A): registrato nello storico', () => {
+  let st = L.initialState(T0);
+  const s = L.newSession(st, T0, { type: 'A' });
+  st = L.skipHangboard(st, s, T0 + 60000);
+  ok(s.hang.skipped);
+  eq(st.events.at(-1).type, 'skip');
+  ok(st.events.at(-1).text.includes('Sessione A'));
+});
+
+test('progressione: conta sessioni A e B insieme', () => {
+  let st = L.initialState(T0);
+  const list = [1, 4, 8, 11].map((d, i) => {
+    const s = hangSession(st, T0 + d * L.DAY);
+    return { ...s, type: i % 2 ? 'B' : 'A' };
+  });
+  st = withSessions(st, list);
+  const sug = L.progressionSuggestion(st, T0 + 15 * L.DAY);
+  ok(sug, 'attesa una proposta');
+  eq(sug.sessions, 4);
+});
+
+test('progressione: le sessioni A con hangboard saltato non contano', () => {
+  let st = L.initialState(T0);
+  const list = [1, 4, 8].map(d => hangSession(st, T0 + d * L.DAY));
+  const skippedA = hangSession(st, T0 + 11 * L.DAY);
+  skippedA.type = 'A';
+  skippedA.hang.skipped = true;
+  st = withSessions(st, [...list, skippedA]);
+  // 3 valide: basta per la soglia minima, ma la A saltata non deve essere contata
+  eq(L.progressionSuggestion(st, T0 + 15 * L.DAY).sessions, 3);
+  st.settings.progressionMinSessions = 4;
+  eq(L.progressionSuggestion(st, T0 + 15 * L.DAY), null);
+});
+
+// =============================== MIGRAZIONE ===============================
+// Dati salvati dalla versione 1 dell'app (prima di A/B), così come erano.
+function v1Data() {
+  return {
+    version: 1,
+    programStart: T0,
+    settings: { ...L.defaultSettings(), bodyKg: 68, addedKg: 3, sound: true },
+    sessions: [
+      {
+        id: 's1', date: T0 + L.DAY, endedAt: T0 + L.DAY + 3600e3, deload: false, pain: false,
+        warmup: { done: true, checks: [true, true, false, false, false, false, false, false] },
+        hang: { edgeMm: 20, grip: 'Half crimp', bodyKg: 68, addedKg: 3, interrupted: null, skipped: false,
+          reps: [{ targetS: 10, heldS: 10, rpe: 8, done: true }] },
+        boulder: { elapsedMs: 1800000, notes: '6b chiuso' },
+        bodyweight: { rounds: [[{ id: 'pullup', value: 7, loadKg: 0, done: true }]] },
+      },
+      {
+        id: 's2', date: T0 + 30 * L.DAY, endedAt: null, deload: true, pain: false,
+        warmup: { done: true, checks: [] }, hang: null,
+        boulder: { elapsedMs: 900000, notes: '' }, bodyweight: { rounds: [] },
+      },
+    ],
+    events: [{ ts: T0 + 2 * L.DAY, type: 'pain', text: 'Dolore alle dita' }],
+    progression: { lastChangeAt: T0, snoozeUntil: 0 },
+    deload: { lastEndAt: T0, activeUntil: 0, snoozeUntil: 0 },
+  };
+}
+
+test('migrazione v1 -> v2: sessioni non classificate, scarico riconosciuto', () => {
+  const st = L.normalizeState(v1Data(), T0 + 40 * L.DAY);
+  eq(st.version, L.STATE_VERSION);
+  eq(st.sessions.map(s => s.type), ['U', 'S']);
+  eq(st.sessions[0].boulder.projects, []);
+  eq(st.sessions[0].boulder.log, []);
+});
+
+test('migrazione v1 -> v2: nessun dato perso', () => {
+  const old = v1Data();
+  const st = L.normalizeState(JSON.parse(JSON.stringify(old)), T0 + 40 * L.DAY);
+  const s = st.sessions[0];
+  eq(s.hang, old.sessions[0].hang);
+  eq(s.warmup, old.sessions[0].warmup);
+  eq(s.bodyweight, old.sessions[0].bodyweight);
+  eq(s.boulder.notes, '6b chiuso');
+  eq(s.boulder.elapsedMs, 1800000);
+  eq(st.events, old.events);
+  eq(st.settings.bodyKg, 68);
+  eq(st.settings.addedKg, 3);
+  eq(st.settings.projectLevel, 5, 'nuove impostazioni con default');
+  eq(st.settings.volumeLevel, 4);
+});
+
+test('migrazione: idempotente e stabile dopo salvataggio', () => {
+  const once = L.normalizeState(v1Data(), T0);
+  const twice = L.normalizeState(JSON.parse(JSON.stringify(once)), T0);
+  eq(twice, once);
+});
+
+test('migrazione: backup JSON v1 importato correttamente', () => {
+  const backup = JSON.stringify({ app: 'scheda-arrampicata', state: v1Data() });
+  const st = L.fromJSON(backup, T0);
+  eq(st.sessions.length, 2);
+  eq(st.sessions[0].type, 'U');
+});
+
+test('migrazione: le sessioni migrate contano ancora per la progressione', () => {
+  let st = L.normalizeState(v1Data(), T0);
+  st.sessions = [];
+  st.events = []; // il dolore dei dati v1 bloccherebbe la progressione
+  st.settings.addedKg = 0;
+  st = withSessions(st, [1, 4, 8, 11].map(d => ({ ...hangSession(st, T0 + d * L.DAY), type: undefined })));
+  st = L.normalizeState(st, T0);
+  eq(st.sessions.map(s => s.type), ['U', 'U', 'U', 'U']);
+  ok(L.progressionSuggestion(st, T0 + 15 * L.DAY), 'proposta presente');
+});
+
+test('migrazione: sessione in corso salvata dalla versione precedente', () => {
+  const oldRun = { session: v1Data().sessions[0], steps: [], idx: 3, timer: null, hollow: null, painStopped: false, flags: {} };
+  const run = L.migrateRun(oldRun);
+  eq(run.session.type, 'U');
+  eq(run.idx, 3);
+  eq(run.rest, null);
+  eq(run.session.boulder.log, []);
+  eq(L.migrateRun(null), null);
+});
+
+test('alternanza dopo la migrazione: parte da A', () => {
+  eq(L.suggestType(L.normalizeState(v1Data(), T0)), 'A');
 });
 
 export default results;

@@ -7,14 +7,16 @@
 import * as L from './logic.js';
 import * as S from './store.js';
 import * as F from './feedback.js';
-import { lineChart } from './charts.js';
+import { lineChart, multiLineChart } from './charts.js';
 
 const $app = document.getElementById('app');
 const now = () => Date.now();
 
 let state = S.loadState(now());
-let run = S.loadRun(); // { session, steps, idx, timer, hollow, painStopped, flags }
-let ui = { screen: run ? 'session' : 'home', detailId: null, modal: null, toast: null };
+// Sessione in corso: { session, steps, idx, timer, hollow, painStopped, flags,
+//   rest (timer di recupero boulder), projIdx (progetto aperto in A), volLevel (livello in B) }
+let run = L.migrateRun(S.loadRun());
+let ui = { screen: run ? 'session' : 'home', detailId: null, modal: null, toast: null, histFilter: 'all' };
 
 F.setFeedbackOptions({ vibration: state.settings.vibration });
 S.requestPersistence();
@@ -51,16 +53,20 @@ const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 // =====================================================================
 const step = () => run?.steps[run.idx];
 
-function startSession() {
-  const deload = L.deloadStatus(state, now()).active;
+// type: 'A' | 'B' (in settimana di scarico sempre 'S')
+function startSession(type) {
+  if (L.deloadStatus(state, now()).active) type = 'S';
   run = {
-    session: L.newSession(state, now(), { deload }),
-    steps: L.buildSteps(state.settings, { deload }),
+    session: L.newSession(state, now(), { type }),
+    steps: L.buildSteps(state.settings, { type }),
     idx: 0,
     timer: null,
     hollow: null,
     painStopped: false,
     flags: {},
+    rest: null,
+    projIdx: 0,
+    volLevel: state.settings.volumeLevel,
   };
   ui.screen = 'session';
   F.keepScreenOn(true);
@@ -113,10 +119,18 @@ function tick() {
     enterStep(run.idx + 1, endAt);
     changed = true;
   }
+  // Timer di recupero del boulder (tra tentativi in A, tra blocchi in B).
+  if (run.rest && L.timerIsDone(run.rest, now())) {
+    run.rest = null;
+    persistRun();
+    F.vibrate('done');
+    F.notify('Recupero finito', run.session.type === 'A' ? 'Pronto per il prossimo tentativo.' : 'Prossimo blocco.');
+    changed = true;
+  }
   // Passi non automatici (riscaldamento, boulder): avvisi una volta sola.
   const st = step();
   if (run.timer && !st.auto) {
-    if (st.kind === 'boulder' && !run.flags.limitDone &&
+    if (st.kind === 'boulder' && st.mode === undefined && !run.flags.limitDone &&
         L.timerElapsed(run.timer, now()) >= state.settings.boulderLimitMin * L.MIN) {
       run.flags.limitDone = true;
       F.vibrate('tick');
@@ -139,7 +153,10 @@ function leaveStep() {
   const st = step();
   const s = run.session;
   if (st.kind === 'warmup') s.warmup.done = true;
-  if (st.kind === 'boulder') s.boulder.elapsedMs = L.timerElapsed(run.timer, now());
+  if (st.kind === 'boulder') {
+    s.boulder.elapsedMs = L.timerElapsed(run.timer, now());
+    run.rest = null;
+  }
 }
 
 function next() {
@@ -155,6 +172,7 @@ function goToIndex(i) {
 }
 
 const idxOf = pred => run.steps.findIndex(pred);
+const curProject = () => run.session.boulder.projects[run.projIdx || 0];
 const firstAfterHang = () => idxOf(x => x.kind === 'boulder');
 
 function togglePause() {
@@ -171,8 +189,7 @@ function skip() {
     const nextRep = idxOf(x => x.kind === 'hangCountdown' && x.rep > st.rep);
     goToIndex(nextRep >= 0 ? nextRep : firstAfterHang());
   } else if (st.kind === 'hangSetup' || st.kind === 'hangConfirm') {
-    run.session.hang.skipped = true;
-    goToIndex(firstAfterHang());
+    askSkipHang();
   } else if (st.kind === 'bw') {
     next(); // esercizio non segnato come fatto
   } else {
@@ -203,6 +220,24 @@ function failHang() {
   F.vibrate('end');
   enterStep(run.idx + 1);
   render();
+}
+
+// "Salta hangboard oggi": con conferma e annotato nello storico.
+function askSkipHang() {
+  modal('Saltare l\'hangboard oggi?', 'Si passa direttamente al boulder. L\'evento resta nello storico e questa sessione non conterà per la progressione.', [
+    { label: 'Sì, salta hangboard', cls: 'primary', fn: () => {
+      state = L.skipHangboard(state, run.session, now());
+      persist();
+      goToIndex(firstAfterHang());
+    } },
+    { label: 'Annulla', cls: 'ghost' },
+  ]);
+}
+
+// Avvia (o fa ripartire) il recupero dopo un tentativo o un blocco.
+function startRest() {
+  run.rest = L.restTimerFor(state.settings, run.session.type, now());
+  F.vibrate('tick');
 }
 
 function painPressed() {
@@ -295,12 +330,14 @@ function viewSession() {
   if (run.painStopped) return viewPainStop();
   const st = step();
   const ph = phaseOf(st);
-  const deload = run.session.deload;
-  const phases = PHASES.filter(p => !(deload && p.id === 'hang'));
+  const noHang = !run.session.hang;
+  const phases = PHASES.filter(p => !(noHang && p.id === 'hang'));
   const phaseIdx = phases.findIndex(p => p.id === ph.id);
+  const type = run.session.type;
 
   const top = `<header class="sbar">
     <button class="icon-btn" data-act="exit" aria-label="Esci">✕</button>
+    <span class="type-tag t${type}">${type === 'U' ? '–' : type}</span>
     <div class="phases">${phases.map((p, i) =>
       `<span class="${i < phaseIdx || ph.id === 'end' ? 'past' : i === phaseIdx ? 'cur' : ''}">${p.name}</span>`).join('')}</div>
     <button class="pain-btn" data-act="pain">🩹 Dolore dita</button>
@@ -315,7 +352,9 @@ function viewSession() {
     case 'hangCountdown': body = viewCountdown(st); mode = 'countdown'; break;
     case 'hang': body = viewHang(st); mode = 'hang'; break;
     case 'hangRest': body = viewHangRest(st); mode = st.last ? '' : 'rest'; break;
-    case 'boulder': body = viewBoulder(); break;
+    case 'boulder':
+      body = st.mode === 'project' ? viewBoulderProject() : st.mode === 'volume' ? viewBoulderVolume() : viewBoulder();
+      break;
     case 'bw': body = viewBw(st); break;
     case 'bwRest': body = viewBwRest(st); mode = 'rest'; break;
     case 'summary': body = viewSummary(); break;
@@ -340,9 +379,10 @@ function viewSession() {
 function viewWarmup() {
   const s = state.settings;
   const checks = run.session.warmup.checks;
-  const items = [...L.WARMUP_MOBILITY, ...Array.from({ length: s.warmupBlocks }, (_, i) => `Blocco facile ${i + 1}`)];
+  const type = run.session.type;
+  const items = L.warmupItems(s, type);
   return `<h1 class="step-title">Riscaldamento</h1>
-    <p class="muted center">Mobilità + ${s.warmupBlocks} blocchi facili progressivi</p>
+    <p class="muted center">Mobilità + ${s.warmupBlocks} blocchi facili progressivi${type === 'A' ? ` + 1–2 di livello ${s.volumeLevel}` : ''}</p>
     ${clockHtml('lg')}
     <div class="checklist">${items.map((t, i) =>
       `<button class="check ${checks[i] ? 'on' : ''}" data-act="check" data-i="${i}"><span class="box">${checks[i] ? '✓' : ''}</span>${esc(t)}</button>`).join('')}
@@ -357,6 +397,7 @@ function viewHangConfirm() {
     <p class="muted center">Le dita devono essere calde prima dei Max Hangs.</p>
     <button class="cta" data-act="confirmWarm">Sì, iniziamo</button>
     <button class="cta ghost" data-act="backWarm">No, torna al riscaldamento</button>
+    ${run.session.type === 'A' ? '<button class="cta ghost" data-act="skipHang">Salta hangboard oggi</button>' : ''}
   </div>`;
 }
 
@@ -370,7 +411,7 @@ function viewHangSetup() {
   const s = state.settings;
   const grips = ['Half crimp', 'Open hand', 'Full crimp'];
   return `<h1 class="step-title">Hangboard · Max Hangs</h1>
-    <p class="muted center">${s.hangReps} × ${s.hangSec} s · recupero ${L.formatClock(s.hangRestSec * 1000)}</p>
+    <p class="muted center">${hangCount()} × ${s.hangSec} s · recupero ${L.formatClock(s.hangRestSec * 1000)}${run.session.type === 'A' ? ' · ridotto (Sessione A)' : ''}</p>
     <div class="setup-row">
       <div class="label">Tacca</div>
       <div class="stepper">
@@ -393,7 +434,8 @@ function viewHangSetup() {
       <p class="hint">Totale ${L.round1(h.bodyKg + h.addedKg)} kg (peso corporeo ${h.bodyKg} kg). Le modifiche valgono per oggi; per renderle fisse usa Impostazioni.</p>
     </div>
     <div class="note">🎯 Target RPE ≈ ${s.rpeTarget}: alla fine dei ${s.hangSec} s dovresti poter tenere ancora 2–3 s.</div>
-    <button class="cta" data-act="next">Inizia sospensioni →</button>`;
+    <button class="cta" data-act="next">Inizia sospensioni →</button>
+    ${run.session.type === 'A' ? '<button class="cta ghost" data-act="skipHang">Salta hangboard oggi</button>' : ''}`;
 }
 
 function hangCount() { return run.steps.filter(x => x.kind === 'hang').length; }
@@ -446,7 +488,7 @@ function viewHangRest(st) {
 function viewBoulder() {
   const s = state.settings;
   const limitPhase = L.timerElapsed(run.timer, now()) < s.boulderLimitMin * L.MIN;
-  const banner = run.session.deload
+  const banner = run.session.deload || run.session.type === 'S'
     ? '<div class="note">🌿 Settimana di scarico: solo blocchi facili.</div>'
     : limitPhase
       ? `<div class="note accent">🔥 Primi ${s.boulderLimitMin} min: 2–3 blocchi vicini al tuo limite.</div>`
@@ -456,6 +498,85 @@ function viewBoulder() {
     ${banner}
     <label class="label" for="notes">Note (blocchi tentati/chiusi, grado)</label>
     <textarea id="notes" data-input="notes" rows="4" placeholder="es. 6b chiuso al 3° tentativo, 6c lavorato">${esc(run.session.boulder.notes)}</textarea>
+    <button class="cta" data-act="next">Boulder finito →</button>`;
+}
+
+// Riquadro del recupero tra tentativi/blocchi (timer secondario).
+function restPanelHtml(labelIdle) {
+  if (!run.rest) return `<div class="rest-panel idle">${labelIdle}</div>`;
+  return `<div class="rest-panel">
+    <div><small>Recupero</small><div class="rest-clock" data-rest>${L.formatClock(L.timerRemaining(run.rest, now()))}</div></div>
+    <button class="btn ghost" data-act="restStop">Salta recupero</button>
+  </div>`;
+}
+
+// Selettore di livello: il livello di riferimento e quelli vicini (scala 1–7).
+function levelChips(current, ref, act) {
+  const opts = [ref - 1, ref, ref + 1].filter(l => l >= L.LEVEL_MIN && l <= L.LEVEL_MAX);
+  return `<div class="chips">${opts.map(l =>
+    `<button class="chip ${l === current ? 'on' : ''}" data-act="${act}" data-v="${l}">Liv. ${l}</button>`).join('')}</div>`;
+}
+
+// ---------------------- Sessione A: boulder al limite ----------------------
+function viewBoulderProject() {
+  const s = state.settings;
+  const b = run.session.boulder;
+  if (!b.projects.length) b.projects.push(L.newProject(s));
+  run.projIdx = clamp(run.projIdx || 0, 0, b.projects.length - 1);
+  const p = b.projects[run.projIdx];
+  const tabs = b.projects.map((x, i) =>
+    `<button class="tab ${i === run.projIdx ? 'on' : ''}" data-act="projTab" data-i="${i}">Progetto ${i + 1}${x.outcome === 'sent' ? ' ✓' : ''}</button>`).join('');
+  return `<h1 class="step-title">Boulder al limite</h1>
+    <p class="muted center">1–2 progetti di livello ${s.projectLevel} · ${s.boulderAMin} min</p>
+    ${clockHtml('md')}
+    <div class="note accent">📉 Smetti quando i tentativi peggiorano invece di migliorare.</div>
+    ${restPanelHtml(`Dopo ogni tentativo tocca il pulsante: parte il recupero di ${L.formatClock(s.attemptRestSec * 1000)}.`)}
+    <div class="tabs">${tabs}<button class="tab add" data-act="projAdd">+ Progetto</button></div>
+    <div class="card project">
+      <div class="label">Livello</div>
+      ${levelChips(p.level, s.projectLevel, 'projLevel')}
+      <button class="big-action attempt" data-act="attempt">
+        <span>Tentativo fatto</span><b>${p.attempts}</b><small>avvia recupero</small>
+      </button>
+      <div class="row-mini"><button class="btn ghost" data-act="attemptMinus">−1 tentativo</button></div>
+      <div class="label">Esito</div>
+      <div class="chips">${Object.entries(L.OUTCOMES).map(([k, v]) =>
+        `<button class="chip ${p.outcome === k ? 'on' : ''} out-${k}" data-act="projOutcome" data-v="${k}">${v}</button>`).join('')}</div>
+      <div class="label">Stile</div>
+      <div class="chips wrap">${L.STYLES.map(st =>
+        `<button class="chip ${p.style === st ? 'on' : ''}" data-act="projStyle" data-v="${st}">${st}</button>`).join('')}</div>
+      <label class="label" for="pnotes">Note progetto</label>
+      <textarea id="pnotes" data-input="projNotes" rows="2" placeholder="es. movimento chiave al 3° appiglio">${esc(p.notes)}</textarea>
+    </div>
+    <button class="cta" data-act="next">Boulder finito →</button>`;
+}
+
+// ---------------------- Sessione B: boulder a volume ----------------------
+function viewBoulderVolume() {
+  const s = state.settings;
+  const v = L.volumeStats(run.session);
+  const prog = L.volumeProgress(run.session, s);
+  const lvl = run.volLevel ?? s.volumeLevel;
+  const easier = Math.max(L.LEVEL_MIN, s.volumeLevel - 1);
+  return `<h1 class="step-title">Boulder a volume</h1>
+    <p class="muted center">Obiettivo ${s.volumeTargetMin}–${s.volumeTargetMax} blocchi di livello ${s.volumeLevel}</p>
+    ${clockHtml('md')}
+    <div class="vol-count">
+      <div><b>${v.total}</b><small>blocchi</small></div>
+      <div class="ok"><b>${v.sent}</b><small>chiusi</small></div>
+      <div class="ko"><b>${v.notSent}</b><small>non chiusi</small></div>
+    </div>
+    <div class="bar target ${prog.reachedMin ? 'reached' : ''}"><div style="width:${prog.pct}%"></div>
+      <span style="left:${Math.round((100 * s.volumeTargetMin) / s.volumeTargetMax)}%"></span></div>
+    ${restPanelHtml(`Ogni +1 avvia il recupero di ${L.formatClock(s.volumeRestSec * 1000)}.`)}
+    <div class="label">Livello del prossimo blocco</div>
+    ${levelChips(lvl, s.volumeLevel, 'volLevel')}
+    <div class="vol-btns">
+      <button class="big-action sent" data-act="volAdd" data-sent="1">+1 chiuso</button>
+      <button class="big-action notsent" data-act="volAdd" data-sent="0">+1 non chiuso</button>
+    </div>
+    <button class="btn ghost wide" data-act="volUndo" ${v.total ? '' : 'disabled'}>↶ Annulla ultimo</button>
+    <div class="note">😮‍💨 Se cadi per stanchezza e non per difficoltà, scendi a livello ${easier}.</div>
     <button class="cta" data-act="next">Boulder finito →</button>`;
 }
 
@@ -499,14 +620,37 @@ function viewBwRest(st) {
   </div>`;
 }
 
+function typeBadge(type) {
+  const t = L.SESSION_TYPES[type] || L.SESSION_TYPES.U;
+  return `<span class="badge type t${t.id}">${t.id === 'S' ? '🌿 ' : ''}${esc(t.short)}</span>`;
+}
+
+function boulderSummaryHtml(s) {
+  const b = s.boulder || {};
+  const out = [];
+  if (b.projects?.length) {
+    const ps = L.projectStats(s);
+    out.push(`<p class="hint">${ps.projects} progett${ps.projects === 1 ? 'o' : 'i'} · ${ps.attempts} tentativi · ${ps.sends} chius${ps.sends === 1 ? 'o' : 'i'}</p>`);
+    out.push(`<ul class="proj-list">${b.projects.map((p, i) => `<li>
+      <b>P${i + 1} · liv. ${p.level}</b>${p.style ? ` · ${esc(p.style)}` : ''} · ${p.attempts} tent.
+      <span class="out out-${p.outcome || 'none'}">${p.outcome ? L.OUTCOMES[p.outcome] : 'esito n.d.'}</span>
+      ${p.notes ? `<small>${esc(p.notes)}</small>` : ''}</li>`).join('')}</ul>`);
+  }
+  if (b.log?.length) {
+    const v = L.volumeStats(s);
+    const lv = Object.keys(v.byLevel).sort().map(l => `liv. ${l}: ${v.byLevel[l].sent}/${v.byLevel[l].sent + v.byLevel[l].notSent}`).join(' · ');
+    out.push(`<p class="hint">${v.total} blocchi · <b>${v.sent} chiusi</b> · ${v.notSent} non chiusi<br>${lv}</p>`);
+  }
+  return out.join('');
+}
+
 function sessionSummaryHtml(s) {
   const parts = [];
-  if (s.deload) parts.push('<div class="badge">🌿 Scarico</div>');
-  if (s.pain) parts.push('<div class="badge danger">🩹 Dolore alle dita</div>');
+  parts.push(`<div class="chips-row">${typeBadge(s.type)}${s.pain ? '<span class="badge danger">🩹 Dolore alle dita</span>' : ''}</div>`);
   parts.push(`<div class="sum-row"><b>Riscaldamento</b><span>${s.warmup?.done ? '✓ completato' : '—'}</span></div>`);
   if (s.hang) {
     const st = L.hangStats(s);
-    if (s.hang.skipped) parts.push('<div class="sum-row"><b>Hangboard</b><span>saltato</span></div>');
+    if (s.hang.skipped) parts.push(`<div class="sum-row"><b>Hangboard</b><span>saltato${s.hang.skipReason ? ' per scelta' : ''}</span></div>`);
     else {
       parts.push(`<div class="sum-row"><b>Hangboard</b><span>${s.hang.edgeMm} mm ${esc(s.hang.grip)} · ${esc(loadLabel(s.hang.addedKg))}${s.hang.interrupted ? ' · interrotto' : ''}</span></div>`);
       parts.push(`<div class="reps">${s.hang.reps.map((r, i) =>
@@ -514,7 +658,10 @@ function sessionSummaryHtml(s) {
       if (st) parts.push(`<p class="hint">RPE medio ${L.round1(st.avgRpe)} · ${st.completed}/${st.planned} tenute complete</p>`);
     }
   }
-  parts.push(`<div class="sum-row"><b>Boulder</b><span>${Math.round((s.boulder?.elapsedMs || 0) / L.MIN)} min</span></div>`);
+  const bMode = L.boulderMode(s.type);
+  const bName = bMode === 'project' ? 'Boulder al limite' : bMode === 'volume' ? 'Boulder a volume' : 'Boulder';
+  parts.push(`<div class="sum-row"><b>${bName}</b><span>${Math.round((s.boulder?.elapsedMs || 0) / L.MIN)} min</span></div>`);
+  parts.push(boulderSummaryHtml(s));
   if (s.boulder?.notes) parts.push(`<p class="notes">${esc(s.boulder.notes)}</p>`);
   const rounds = s.bodyweight?.rounds || [];
   parts.push(`<table class="bw-table"><tr><th></th>${rounds.map((_, i) => `<th>G${i + 1}</th>`).join('')}</tr>
@@ -553,6 +700,10 @@ function updateClocks() {
     const el = $app.querySelector('[data-stopwatch]');
     if (el) el.textContent = `${Math.floor((now() - run.hollow.startedAt) / 1000)} s`;
   }
+  if (run.rest) {
+    const el = $app.querySelector('[data-rest]');
+    if (el) el.textContent = L.formatClock(L.timerRemaining(run.rest, now()));
+  }
 }
 
 // =====================================================================
@@ -589,21 +740,43 @@ function viewHome() {
       </div></div>`);
   }
 
-  const deload = dl.active;
-  return `<div class="page">
-    <header class="hero">
+  const hero = `<header class="hero">
       <div class="logo">🧗</div>
       <div><h1>Scheda arrampicata</h1>
-      <p class="muted">${last ? `Ultima sessione: ${fmtDate(last.date)}` : 'Nessuna sessione ancora'}</p></div>
-    </header>
-    ${cards.join('')}
-    <div class="card plan">
-      <div class="plan-row"><span>1</span><i class="pl">Riscaldamento</i> <b>${s.warmupMin} min</b></div>
-      <div class="plan-row ${deload ? 'off' : ''}"><span>2</span><i class="pl">Max Hangs</i> <b>${s.hangReps}×${s.hangSec}s · ${s.edgeMm} mm · ${esc(L.fmtKg(s.addedKg))}</b></div>
-      <div class="plan-row"><span>3</span><i class="pl">Boulder${deload ? ' facile' : ''}</i> <b>${s.boulderMin} min</b></div>
-      <div class="plan-row"><span>4</span><i class="pl">Corpo libero</i> <b>${s.bwRounds} giri</b></div>
-    </div>
-    <button class="cta start" data-act="start">${deload ? 'Inizia sessione di scarico' : 'Inizia sessione'}</button>
+      <p class="muted">${last ? `Ultima: ${fmtDate(last.date)} · ${esc((L.SESSION_TYPES[last.type] || L.SESSION_TYPES.U).short)}` : 'Nessuna sessione ancora'}</p></div>
+    </header>`;
+  const common = `<p class="muted small center">Per entrambe: riscaldamento ${s.warmupMin} min · corpo libero ${s.bwRounds} giri · tacca ${s.edgeMm} mm · ${esc(L.fmtKg(s.addedKg))}</p>`;
+
+  // Settimana di scarico: una sola sessione possibile, niente scelta A/B.
+  if (dl.active) {
+    return `<div class="page">${hero}${cards.join('')}
+      <div class="card plan">
+        <div class="plan-row"><span>1</span><i class="pl">Riscaldamento</i> <b>${s.warmupMin} min</b></div>
+        <div class="plan-row off"><span>2</span><i class="pl">Max Hangs</i> <b>non in scarico</b></div>
+        <div class="plan-row"><span>3</span><i class="pl">Boulder facile</i> <b>${s.boulderMin} min</b></div>
+        <div class="plan-row"><span>4</span><i class="pl">Corpo libero</i> <b>${s.bwRounds} giri</b></div>
+      </div>
+      <button class="cta start" data-act="start" data-type="S">Inizia sessione di scarico</button>
+    </div>`;
+  }
+
+  const sug = L.suggestType(state);
+  const choice = (type, title, lines) => `<button class="session-pick t${type} ${sug === type ? 'suggested' : ''}" data-act="start" data-type="${type}">
+      <span class="pick-head"><span class="type-tag t${type}">${type}</span><b>${title}</b>${sug === type ? '<em>consigliata</em>' : ''}</span>
+      <span class="pick-lines">${lines.map(l => `<span>${l}</span>`).join('')}</span>
+    </button>`;
+
+  return `<div class="page">${hero}${cards.join('')}
+    <h3 class="section">Scegli la sessione di oggi</h3>
+    ${choice('A', 'Limite', [
+      `Hangboard ridotto ${s.hangRepsA}×${s.hangSec}s`,
+      `Boulder al limite ${s.boulderAMin} min · progetti liv. ${s.projectLevel}`,
+    ])}
+    ${choice('B', 'Volume', [
+      `Hangboard completo ${s.hangReps}×${s.hangSec}s`,
+      `Boulder a volume ${s.boulderBMin} min · ${s.volumeTargetMin}–${s.volumeTargetMax} blocchi liv. ${s.volumeLevel}`,
+    ])}
+    ${common}
   </div>`;
 }
 
@@ -611,7 +784,19 @@ function viewHome() {
 // STORICO
 // =====================================================================
 function viewHistory() {
-  const sessions = [...state.sessions].sort((a, b) => a.date - b.date);
+  const f = ui.histFilter;
+  const all = [...state.sessions].sort((a, b) => a.date - b.date);
+  const sessions = f === 'all' ? all : all.filter(s => s.type === f);
+  const count = t => all.filter(s => s.type === t).length;
+  const filters = [['all', `Tutte (${all.length})`], ['A', `A · Limite (${count('A')})`], ['B', `B · Volume (${count('B')})`]];
+
+  // Grafici specifici dei due tipi
+  const bSessions = all.filter(s => s.type === 'B' && s.boulder?.log?.length);
+  const volPts = bSessions.map(s => ({ x: s.date, y: L.volumeStats(s).sent }));
+  const aSessions = all.filter(s => s.type === 'A' && s.boulder?.projects?.some(p => p.attempts || p.outcome));
+  const attPts = aSessions.map(s => ({ x: s.date, y: L.projectStats(s).attempts }));
+  const sendPts = aSessions.map(s => ({ x: s.date, y: L.projectStats(s).sends }));
+
   let prevEdge = null;
   const hangPts = [];
   for (const s of sessions) {
@@ -625,26 +810,43 @@ function viewHistory() {
   const list = [...sessions].reverse().map(s => {
     const st = L.hangStats(s);
     const pull = L.bwTotal(s, 'pullup');
-    const chips = [];
-    if (s.deload) chips.push('<span class="badge">🌿 scarico</span>');
+    const chips = [typeBadge(s.type)];
     if (s.pain) chips.push('<span class="badge danger">🩹 dolore</span>');
+    if (s.hang?.skipped) chips.push('<span class="badge">hangboard saltato</span>');
     if (st) chips.push(`<span class="badge">${st.edgeMm}mm · ${st.totalKg}kg · RPE ${L.round1(st.avgRpe)}</span>`);
+    if (s.type === 'A' && s.boulder?.projects?.length) {
+      const ps = L.projectStats(s);
+      chips.push(`<span class="badge">progetti ${ps.sends}/${ps.projects} · ${ps.attempts} tent.</span>`);
+    }
+    if (s.boulder?.log?.length) {
+      const v = L.volumeStats(s);
+      chips.push(`<span class="badge">blocchi ${v.sent}/${v.total}</span>`);
+    }
     if (pull != null) chips.push(`<span class="badge">trazioni ${pull}</span>`);
-    return `<button class="hist-item" data-act="detail" data-id="${esc(s.id)}">
+    return `<button class="hist-item t${s.type}" data-act="detail" data-id="${esc(s.id)}">
       <div class="hist-date">${fmtDate(s.date)} <small>${fmtTime(s.date)}</small></div>
       <div class="chips-row">${chips.join('')}</div></button>`;
   }).join('');
 
   const events = [...state.events].reverse().slice(0, 20).map(e => {
-    const icon = { pain: '🩹', progression: '📈', deload: '🌿' }[e.type] || '•';
+    const icon = { pain: '🩹', progression: '📈', deload: '🌿', skip: '⏭' }[e.type] || '•';
     return `<li><span>${icon}</span><div>${esc(e.text)}<small>${fmtDate(e.ts)}</small></div></li>`;
   }).join('');
 
+  const chartB = f !== 'A' ? `<div class="card"><h3>Sessioni B · blocchi chiusi</h3>${lineChart(volPts, { unit: 'blocchi', color: 'var(--blue)' })}</div>` : '';
+  const chartA = f !== 'B' ? `<div class="card"><h3>Sessioni A · progetti</h3>${multiLineChart([
+    { name: 'Tentativi', color: 'var(--accent)', points: attPts },
+    { name: 'Chiusure', color: 'var(--green)', points: sendPts },
+  ], { unit: '', integer: true })}</div>` : '';
+
   return `<div class="page">
     <h1 class="page-title">Storico</h1>
+    <div class="filters">${filters.map(([id, label]) =>
+      `<button class="chip ${f === id ? 'on' : ''}" data-act="histFilter" data-v="${id}">${label}</button>`).join('')}</div>
     <div class="card"><h3>Hangboard · carico totale (kg)</h3>${lineChart(hangPts, { unit: 'kg' })}</div>
+    ${chartA}${chartB}
     <div class="card"><h3>Trazioni · ripetizioni totali</h3>${lineChart(pullPts, { unit: 'rip', color: 'var(--blue)' })}</div>
-    ${events ? `<div class="card"><h3>Eventi</h3><ul class="events">${events}</ul></div>` : ''}
+    ${events && f === 'all' ? `<div class="card"><h3>Eventi</h3><ul class="events">${events}</ul></div>` : ''}
     <h3 class="section">Sessioni (${sessions.length})</h3>
     ${list || '<p class="muted">Nessuna sessione salvata.</p>'}
   </div>`;
@@ -674,8 +876,23 @@ const SETTINGS_FORM = [
     ['warmupMin', 'Durata', 'min', 1],
     ['warmupBlocks', 'Blocchi facili', '', 1],
   ]],
+  ['Livelli (scala palestra 1–7)', [
+    ['volumeLevel', 'Livello volume', '', 1],
+    ['projectLevel', 'Livello progetto', '', 1],
+  ]],
+  ['Sessione A · Limite', [
+    ['hangRepsA', 'Sospensioni hangboard', '', 1],
+    ['boulderAMin', 'Boulder al limite', 'min', 1],
+    ['attemptRestSec', 'Recupero tra tentativi', 's', 15],
+  ]],
+  ['Sessione B · Volume', [
+    ['hangReps', 'Sospensioni hangboard', '', 1],
+    ['boulderBMin', 'Boulder a volume', 'min', 1],
+    ['volumeRestSec', 'Recupero tra blocchi', 's', 15],
+    ['volumeTargetMin', 'Obiettivo blocchi (min)', '', 1],
+    ['volumeTargetMax', 'Obiettivo blocchi (max)', '', 1],
+  ]],
   ['Hangboard', [
-    ['hangReps', 'Sospensioni', '', 1],
     ['hangSec', 'Durata sospensione', 's', 1],
     ['hangRestSec', 'Recupero', 's', 15],
     ['countdownSec', 'Conto alla rovescia', 's', 1],
@@ -683,9 +900,8 @@ const SETTINGS_FORM = [
     ['addedKg', 'Carico (+ zavorra / − alleggerimento)', 'kg', 0.5],
     ['rpeTarget', 'RPE target', '', 1],
   ]],
-  ['Boulder', [
-    ['boulderMin', 'Durata', 'min', 1],
-    ['boulderLimitMin', 'Minuti al limite', 'min', 1],
+  ['Settimana di scarico', [
+    ['boulderMin', 'Boulder facile', 'min', 1],
   ]],
   ['Corpo libero', [
     ['bwRounds', 'Giri', '', 1],
@@ -728,7 +944,7 @@ function viewSettings() {
         <button class="btn danger" data-act="resetAll">Cancella tutti i dati</button>
       </div>
     </div>
-    <p class="muted center small">Scheda arrampicata · v1.0</p>
+    <p class="muted center small">Scheda arrampicata · v2.0 (sessioni A/B)</p>
   </div>`;
 }
 
@@ -809,7 +1025,37 @@ function render() {
 // GESTIONE TOCCHI E INPUT
 // =====================================================================
 const actions = {
-  start: () => startSession(),
+  start: el => startSession(el.dataset.type || L.suggestType(state)),
+  skipHang: () => askSkipHang(),
+  restStop: () => { run.rest = null; persistRun(); render(); },
+  // --- boulder A ---
+  projTab: el => { run.projIdx = Number(el.dataset.i); persistRun(); render(); },
+  projAdd: () => {
+    run.session.boulder.projects.push(L.newProject(state.settings));
+    run.projIdx = run.session.boulder.projects.length - 1;
+    persistRun(); render();
+  },
+  projLevel: el => { curProject().level = L.clampLevel(el.dataset.v); persistRun(); render(); },
+  projOutcome: el => {
+    const p = curProject();
+    p.outcome = p.outcome === el.dataset.v ? null : el.dataset.v;
+    persistRun(); render();
+  },
+  projStyle: el => {
+    const p = curProject();
+    p.style = p.style === el.dataset.v ? '' : el.dataset.v;
+    persistRun(); render();
+  },
+  attempt: () => { L.addAttempt(curProject()); startRest(); persistRun(); render(); },
+  attemptMinus: () => { L.addAttempt(curProject(), -1); persistRun(); render(); },
+  // --- boulder B ---
+  volLevel: el => { run.volLevel = L.clampLevel(el.dataset.v); persistRun(); render(); },
+  volAdd: el => {
+    L.volumeAdd(run.session.boulder, run.volLevel ?? state.settings.volumeLevel, el.dataset.sent === '1', now());
+    startRest();
+    persistRun(); render();
+  },
+  volUndo: () => { L.volumeUndo(run.session.boulder); persistRun(); render(); },
   next: () => next(),
   pause: () => togglePause(),
   skip: () => skip(),
@@ -897,6 +1143,7 @@ const actions = {
   // --- navigazione / storico ---
   nav: el => { ui.screen = el.dataset.to; render(); window.scrollTo(0, 0); },
   detail: el => { ui.detailId = el.dataset.id; ui.screen = 'detail'; render(); },
+  histFilter: el => { ui.histFilter = el.dataset.v; render(); },
   deleteSession: el => modal('Eliminare la sessione?', 'L\'operazione non si può annullare.', [
     { label: 'Elimina', cls: 'danger', fn: () => {
       state.sessions = state.sessions.filter(s => s.id !== el.dataset.id);
@@ -931,6 +1178,9 @@ document.addEventListener('input', e => {
   if (el.matches('[data-input="notes"]') && run) {
     run.session.boulder.notes = el.value;
     persistRun();
+  } else if (el.matches('[data-input="projNotes"]') && run) {
+    curProject().notes = el.value;
+    persistRun();
   }
 });
 
@@ -941,7 +1191,9 @@ document.addEventListener('change', async e => {
     if (el.type === 'number') {
       const v = parseFloat(el.value.replace(',', '.'));
       if (Number.isNaN(v)) { render(); return; }
-      state.settings[key] = v;
+      // I livelli seguono la scala della palestra (1–7)
+      state.settings[key] = ['volumeLevel', 'projectLevel'].includes(key) ? L.clampLevel(v) : v;
+      if (state.settings[key] !== v) el.value = state.settings[key];
     } else {
       state.settings[key] = el.value.trim() || L.defaultSettings()[key];
     }
