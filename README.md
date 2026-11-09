@@ -19,7 +19,7 @@ scheda-arrampicata/
 │   ├── store.js           salvataggio locale (localStorage) + sessione in corso
 │   ├── feedback.js        vibrazione, schermo acceso, notifiche (nessun suono)
 │   └── charts.js          grafici SVG senza librerie
-├── icons/                 icone PNG (192, 512, maskable)
+├── icons/                 icone PNG (192, 512, maskable) + genera-icona.ps1 che le disegna
 ├── tests/
 │   ├── index.html         esegue i test nel browser
 │   └── logic.test.js      55 unit test (timer, sessioni A/B, progressione, scarico, migrazione, export)
