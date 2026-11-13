@@ -581,8 +581,9 @@ function viewBoulderVolume() {
 }
 
 function viewBw(st) {
-  const ex = L.BW_EXERCISES[st.exIndex];
   const e = run.session.bodyweight.rounds[st.round][st.exIndex];
+  // L'esercizio si ricava dall'id salvato: una sessione rimasta in corso col vecchio ordine resta coerente
+  const ex = L.bwExercise(e.id) || L.BW_EXERCISES[st.exIndex];
   const isTime = ex.unit === 's';
   const stopwatch = isTime ? `<div class="stopwatch">
       ${run.hollow
@@ -612,7 +613,7 @@ function viewBw(st) {
 }
 
 function viewBwRest(st) {
-  const nextEx = L.BW_EXERCISES[0];
+  const nextEx = L.bwExercise(run.session.bodyweight.rounds[st.round + 1]?.[0]?.id) || L.BW_EXERCISES[0];
   return `<div class="center-block">
     <div class="rest-label">Recupero tra i giri</div>
     ${clockHtml('xl')}
@@ -665,8 +666,8 @@ function sessionSummaryHtml(s) {
   if (s.boulder?.notes) parts.push(`<p class="notes">${esc(s.boulder.notes)}</p>`);
   const rounds = s.bodyweight?.rounds || [];
   parts.push(`<table class="bw-table"><tr><th></th>${rounds.map((_, i) => `<th>G${i + 1}</th>`).join('')}</tr>
-    ${L.BW_EXERCISES.map((ex, ei) => `<tr><td>${esc(ex.name)}</td>${rounds.map(r => {
-      const e = r[ei];
+    ${L.BW_EXERCISES.map(ex => `<tr><td>${esc(ex.name)}</td>${rounds.map(r => {
+      const e = r.find(x => x.id === ex.id); // per id: vale anche per le sessioni col vecchio ordine
       return `<td>${e?.done ? `${e.value}${e.loadKg ? `<small>${e.loadKg > 0 ? '+' : ''}${e.loadKg}kg</small>` : ''}` : '—'}</td>`;
     }).join('')}</tr>`).join('')}</table>`);
   return parts.join('');

@@ -581,4 +581,29 @@ test('alternanza dopo la migrazione: parte da A', () => {
   eq(L.suggestType(L.normalizeState(v1Data(), T0)), 'A');
 });
 
+// ============================ ORDINE CORPO LIBERO ============================
+test('corpo libero: ordine trazioni → addominali → piegamenti → affondi', () => {
+  eq(L.BW_EXERCISES.map(e => e.id), ['pullup', 'hollow', 'pushup', 'lunge']);
+  const s = L.newSession(L.initialState(T0), T0, { type: 'B' });
+  s.bodyweight.rounds.forEach(r => eq(r.map(e => e.id), ['pullup', 'hollow', 'pushup', 'lunge']));
+  const steps = L.buildSteps(L.defaultSettings(), { type: 'B' }).filter(x => x.kind === 'bw' && x.round === 0);
+  eq(steps.map(x => L.BW_EXERCISES[x.exIndex].id), ['pullup', 'hollow', 'pushup', 'lunge']);
+});
+
+test('corpo libero: precompilazione corretta da una sessione col vecchio ordine', () => {
+  let st = L.initialState(T0);
+  const old = L.newSession(st, T0);
+  // vecchio ordine: trazioni, piegamenti, hollow, affondi
+  old.bodyweight.rounds = [[
+    { id: 'pullup', value: 7, loadKg: 0, done: true },
+    { id: 'pushup', value: 14, loadKg: 0, done: true },
+    { id: 'hollow', value: 28, loadKg: 0, done: true },
+    { id: 'lunge', value: 9, loadKg: 0, done: true },
+  ]];
+  st = withSessions(st, [old]);
+  const next = L.newSession(st, T0 + L.DAY);
+  eq(next.bodyweight.rounds[0].map(e => [e.id, e.value]), [['pullup', 7], ['hollow', 28], ['pushup', 14], ['lunge', 9]]);
+  eq(L.bwTotal(old, 'pushup'), 14, 'totali per id');
+});
+
 export default results;

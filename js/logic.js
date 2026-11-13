@@ -57,13 +57,21 @@ export function defaultSettings() {
   };
 }
 
-// Esercizi a corpo libero: "unit" indica se si registrano ripetizioni o secondi.
+// Esercizi a corpo libero, nell'ordine in cui si eseguono in ogni giro.
+// "unit" indica se si registrano ripetizioni o secondi. Le sessioni salvate
+// identificano gli esercizi per "id", quindi l'ordine si può cambiare senza
+// rovinare lo storico.
 export const BW_EXERCISES = [
   { id: 'pullup', name: 'Trazioni', unit: 'rip', min: 5, max: 8, loadable: true },
+  { id: 'hollow', name: 'Addominali (hollow body)', unit: 's', min: 20, max: 30, loadable: false },
   { id: 'pushup', name: 'Piegamenti', unit: 'rip', min: 10, max: 15, loadable: true },
-  { id: 'hollow', name: 'Hollow body hold', unit: 's', min: 20, max: 30, loadable: false },
   { id: 'lunge', name: 'Affondi laterali', unit: 'rip/lato', min: 8, max: 10, loadable: true },
 ];
+
+// Esercizio a partire dall'id (le sessioni vecchie hanno un altro ordine).
+export function bwExercise(id) {
+  return BW_EXERCISES.find(x => x.id === id);
+}
 
 export const WARMUP_MOBILITY = ['Mobilità spalle', 'Mobilità polsi e dita'];
 

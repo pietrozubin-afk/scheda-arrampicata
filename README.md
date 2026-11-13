@@ -22,7 +22,7 @@ scheda-arrampicata/
 ├── icons/                 icone PNG (192, 512, maskable) + genera-icona.ps1 che le disegna
 ├── tests/
 │   ├── index.html         esegue i test nel browser
-│   └── logic.test.js      55 unit test (timer, sessioni A/B, progressione, scarico, migrazione, export)
+│   └── logic.test.js      57 unit test (timer, sessioni A/B, progressione, scarico, migrazione, export)
 └── serve.ps1              piccolo server locale per provare l'app sul PC
 ```
 
@@ -62,7 +62,8 @@ senza hangboard, con boulder facile.
    eventuali secondi in meno ("Ceduto prima").
 4. **Boulder**: al limite (A) o a volume (B), con timer della fase e timer di
    recupero separato.
-5. **Corpo libero**: 3 giri × 4 esercizi, valori precompilati dalla sessione
+5. **Corpo libero**: 3 giri × 4 esercizi (trazioni → addominali → piegamenti →
+   affondi), valori precompilati dalla sessione
    precedente, cronometro per l'hollow body, recupero tra i giri.
 6. **Riepilogo** e salvataggio.
 
