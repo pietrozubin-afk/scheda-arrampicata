@@ -101,6 +101,26 @@ function onAutoEnd(st) {
   } else if (st.kind === 'hangRest') {
     F.vibrate('done');
     F.notify('Fine recupero', 'Preparati alla prossima sospensione.');
+  } else if (st.kind === 'hangSetCountdown') {
+    F.vibrate('go');
+    F.notify(`Serie ${st.set + 1}/${setCount()}`, 'VAI! Appeso.');
+  } else if (st.kind === 'hangOn') {
+    // Fine di una ripetizione: se è l'ultima, la serie è completa.
+    const n = run.session.hang.repsPerSet;
+    if (st.rep === n - 1) {
+      const set = s.hang.sets[st.set];
+      set.heldReps = n;
+      set.done = true;
+      F.vibrate('end');
+      F.notify('Fine serie', 'Recupero: inserisci l\'RPE.');
+    } else {
+      F.vibrate('tick');
+    }
+  } else if (st.kind === 'hangOff') {
+    F.vibrate('go');
+  } else if (st.kind === 'hangSetRest') {
+    F.vibrate('done');
+    F.notify('Fine recupero', 'Preparati alla prossima serie.');
   } else if (st.kind === 'bwRest') {
     F.vibrate('done');
     F.notify('Fine recupero', 'Inizia il prossimo giro.');
@@ -184,7 +204,11 @@ function togglePause() {
 
 function skip() {
   const st = step();
-  if (st.kind === 'hangCountdown' || st.kind === 'hang') {
+  if (['hangSetCountdown', 'hangOn', 'hangOff'].includes(st.kind)) {
+    // Salta il resto di questa serie (resta "non eseguita") e vai alla successiva.
+    const nextSet = idxOf(x => x.kind === 'hangSetCountdown' && x.set > st.set);
+    goToIndex(nextSet >= 0 ? nextSet : firstAfterHang());
+  } else if (st.kind === 'hangCountdown' || st.kind === 'hang') {
     // Salta questa sospensione (resta "non eseguita") e vai alla successiva.
     const nextRep = idxOf(x => x.kind === 'hangCountdown' && x.rep > st.rep);
     goToIndex(nextRep >= 0 ? nextRep : firstAfterHang());
@@ -199,7 +223,13 @@ function skip() {
 
 function repeat() {
   const st = step();
-  if (['hangCountdown', 'hang', 'hangRest'].includes(st.kind)) {
+  if (L.isRepeaterStep(st)) {
+    // Ripeti la serie corrente dal 3-2-1.
+    const set = run.session.hang.sets[st.set];
+    set.done = false;
+    set.heldReps = null;
+    goToIndex(idxOf(x => x.kind === 'hangSetCountdown' && x.set === st.set));
+  } else if (['hangCountdown', 'hang', 'hangRest'].includes(st.kind)) {
     // Ripeti la sospensione corrente dal 3-2-1.
     const r = run.session.hang.reps[st.rep];
     r.done = false;
@@ -214,6 +244,16 @@ function repeat() {
 // Ceduto prima dei secondi previsti: registra il tempo effettivo.
 function failHang() {
   const st = step();
+  if (st.kind === 'hangOn' || st.kind === 'hangOff') {
+    // Repeaters: contano le ripetizioni tenute fino in fondo, poi si va al recupero della serie.
+    const set = run.session.hang.sets[st.set];
+    set.heldReps = st.kind === 'hangOn' ? st.rep : st.rep + 1;
+    set.done = true;
+    F.vibrate('end');
+    enterStep(idxOf(x => x.kind === 'hangSetRest' && x.set === st.set));
+    render();
+    return;
+  }
   const r = run.session.hang.reps[st.rep];
   r.heldS = Math.floor(L.timerElapsed(run.timer, now()) / 1000);
   r.done = true;
@@ -253,11 +293,13 @@ function painStop() {
   const t = now();
   s.pain = true;
   s.painAt = t;
-  const hangPending = s.hang && !s.hang.skipped && run.idx <= idxOf(x => x.kind === 'hangRest' && x.last);
+  const hangPending = s.hang && !s.hang.skipped && run.idx <= idxOf(x => (x.kind === 'hangRest' || x.kind === 'hangSetRest') && x.last);
   if (hangPending) s.hang.interrupted = 'pain';
   const phase = phaseOf(st).name.toLowerCase();
+  const where = !hangPending ? ''
+    : st.set != null ? `, serie ${st.set + 1}` : `, sospensione ${(st.rep ?? 0) + 1}`;
   // L'evento si salva subito, anche se poi la sessione venisse scartata.
-  state.events.push({ ts: t, type: 'pain', text: `Dolore alle dita (${phase}${hangPending ? `, sospensione ${(st.rep ?? 0) + 1}` : ''})` });
+  state.events.push({ ts: t, type: 'pain', text: `Dolore alle dita (${phase}${where})` });
   persist();
   leaveStep();
   if (run.timer) run.timer = L.pauseTimer(run.timer, t);
@@ -352,6 +394,10 @@ function viewSession() {
     case 'hangCountdown': body = viewCountdown(st); mode = 'countdown'; break;
     case 'hang': body = viewHang(st); mode = 'hang'; break;
     case 'hangRest': body = viewHangRest(st); mode = st.last ? '' : 'rest'; break;
+    case 'hangSetCountdown': body = viewSetCountdown(st); mode = 'countdown'; break;
+    case 'hangOn': body = viewHangOn(st); mode = 'hang'; break;
+    case 'hangOff': body = viewHangOff(st); mode = 'rest'; break;
+    case 'hangSetRest': body = viewSetRest(st); mode = st.last ? '' : 'rest'; break;
     case 'boulder':
       body = st.mode === 'project' ? viewBoulderProject() : st.mode === 'volume' ? viewBoulderVolume() : viewBoulder();
       break;
@@ -362,10 +408,10 @@ function viewSession() {
 
   // Pulsanti di controllo comuni
   const ctrls = [];
-  if (run.timer && st.kind !== 'hangCountdown') {
+  if (run.timer && st.kind !== 'hangCountdown' && st.kind !== 'hangSetCountdown') {
     ctrls.push(`<button class="ctrl" data-act="pause">${L.timerIsPaused(run.timer) ? '▶ Riprendi' : '⏸ Pausa'}</button>`);
   }
-  if (run.timer || ['hangCountdown', 'hang', 'hangRest'].includes(st.kind)) {
+  if (run.timer || ['hangCountdown', 'hang', 'hangRest'].includes(st.kind) || L.isRepeaterStep(st)) {
     ctrls.push(`<button class="ctrl" data-act="repeat">↺ Ripeti</button>`);
   }
   if (!['summary', 'hangConfirm'].includes(st.kind)) {
@@ -394,7 +440,7 @@ function viewHangConfirm() {
   return `<div class="center-block">
     <div class="big-emoji">🔥</div>
     <h1 class="step-title">Riscaldamento completato?</h1>
-    <p class="muted center">Le dita devono essere calde prima dei Max Hangs.</p>
+    <p class="muted center">Le dita devono essere calde prima ${run.session.hang?.protocol === 'repeaters' ? 'dei repeaters' : 'delle Max Hangs'}.</p>
     <button class="cta" data-act="confirmWarm">Sì, iniziamo</button>
     <button class="cta ghost" data-act="backWarm">No, torna al riscaldamento</button>
     ${run.session.type === 'A' ? '<button class="cta ghost" data-act="skipHang">Salta hangboard oggi</button>' : ''}
@@ -410,8 +456,16 @@ function viewHangSetup() {
   const h = run.session.hang;
   const s = state.settings;
   const grips = ['Half crimp', 'Open hand', 'Full crimp'];
-  return `<h1 class="step-title">Hangboard · Max Hangs</h1>
-    <p class="muted center">${hangCount()} × ${s.hangSec} s · recupero ${L.formatClock(s.hangRestSec * 1000)}${run.session.type === 'A' ? ' · ridotto (Sessione A)' : ''}</p>
+  const rep = h.protocol === 'repeaters';
+  const title = rep ? 'Hangboard · Repeaters' : 'Hangboard · Max Hangs';
+  const plan = rep
+    ? `${setCount()} serie × ${h.repsPerSet} ripetizioni · ${h.onSec} s appeso / ${h.offSec} s riposo · recupero ${L.formatClock(s.repSetRestSec * 1000)} tra le serie`
+    : `${hangCount()} × ${s.hangSec} s · recupero ${L.formatClock(s.hangRestSec * 1000)}`;
+  const target = rep
+    ? `🎯 Target RPE ≈ ${s.rpeTarget} a fine serie: l'ultima ripetizione è dura ma la tieni tutta. Se cedi presto, alleggerisci.`
+    : `🎯 Target RPE ≈ ${s.rpeTarget}: alla fine dei ${s.hangSec} s dovresti poter tenere ancora 2–3 s.`;
+  return `<h1 class="step-title">${title}</h1>
+    <p class="muted center">${plan}</p>
     <div class="setup-row">
       <div class="label">Tacca</div>
       <div class="stepper">
@@ -433,12 +487,81 @@ function viewHangSetup() {
       </div>
       <p class="hint">Totale ${L.round1(h.bodyKg + h.addedKg)} kg (peso corporeo ${h.bodyKg} kg). Le modifiche valgono per oggi; per renderle fisse usa Impostazioni.</p>
     </div>
-    <div class="note">🎯 Target RPE ≈ ${s.rpeTarget}: alla fine dei ${s.hangSec} s dovresti poter tenere ancora 2–3 s.</div>
-    <button class="cta" data-act="next">Inizia sospensioni →</button>
+    <div class="note">${target}</div>
+    <button class="cta" data-act="next">${rep ? 'Inizia repeaters →' : 'Inizia sospensioni →'}</button>
     ${run.session.type === 'A' ? '<button class="cta ghost" data-act="skipHang">Salta hangboard oggi</button>' : ''}`;
 }
 
 function hangCount() { return run.steps.filter(x => x.kind === 'hang').length; }
+function setCount() { return run.steps.filter(x => x.kind === 'hangSetCountdown').length; }
+
+// ---------------------- Repeaters (Sessione B) ----------------------
+// Puntini delle ripetizioni della serie: fatte, in corso, da fare.
+function repDots(st, n) {
+  return `<div class="rep-dots">${Array.from({ length: n }, (_, i) =>
+    `<span class="${i < st.rep || (i === st.rep && st.kind === 'hangOff') ? 'done' : i === st.rep ? 'cur' : ''}"></span>`).join('')}</div>`;
+}
+
+function viewSetCountdown(st) {
+  const h = run.session.hang;
+  const sec = Math.ceil(L.timerRemaining(run.timer, now()) / 1000);
+  return `<div class="center-block">
+    <div class="rep-label">Serie ${st.set + 1}/${setCount()} · ${h.repsPerSet} × ${h.onSec}/${h.offSec} s</div>
+    <div class="clock xxl" data-clock data-secs>${sec}</div>
+    <div class="phase-word">Preparati</div>
+  </div>`;
+}
+
+function viewHangOn(st) {
+  const h = run.session.hang;
+  const sec = Math.ceil(L.timerRemaining(run.timer, now()) / 1000);
+  return `<div class="center-block">
+    <div class="rep-label">Serie ${st.set + 1}/${setCount()} · ripetizione ${st.rep + 1}/${h.repsPerSet} · ${h.edgeMm} mm · ${esc(loadLabel(h.addedKg))}</div>
+    <div class="clock xxl" data-clock data-secs>${sec}</div>
+    <div class="phase-word">APPESO</div>
+    ${repDots(st, h.repsPerSet)}
+    ${L.timerIsPaused(run.timer) ? '<p class="center">In pausa</p>' : ''}
+    <button class="cta ghost" data-act="failHang">Ceduto</button>
+  </div>`;
+}
+
+function viewHangOff(st) {
+  const h = run.session.hang;
+  const sec = Math.ceil(L.timerRemaining(run.timer, now()) / 1000);
+  return `<div class="center-block">
+    <div class="rep-label">Serie ${st.set + 1}/${setCount()} · prossima ripetizione ${st.rep + 2}/${h.repsPerSet}</div>
+    <div class="clock xxl" data-clock data-secs>${sec}</div>
+    <div class="phase-word">MOLLA</div>
+    ${repDots(st, h.repsPerSet)}
+    ${L.timerIsPaused(run.timer) ? '<p class="center">In pausa</p>' : ''}
+    <button class="cta ghost" data-act="failHang">Non riparto: serie finita</button>
+  </div>`;
+}
+
+function viewSetRest(st) {
+  const h = run.session.hang;
+  const x = h.sets[st.set];
+  const s = state.settings;
+  const held = L.setHeldReps(h, x);
+  const rpeBtns = Array.from({ length: 10 }, (_, i) => i + 1).map(v =>
+    `<button class="rpe ${x.rpe === v ? 'on' : ''} ${v === s.rpeTarget ? 'target' : ''}" data-act="rpe" data-v="${v}">${v}</button>`).join('');
+  return `<div class="rep-label center">Serie ${st.set + 1}/${setCount()} · registrazione</div>
+    ${st.last ? '' : `<div class="rest-label">Recupero tra le serie</div>${clockHtml('lg')}`}
+    <div class="setup-row">
+      <div class="label">Ripetizioni tenute ${held >= h.repsPerSet ? '✓ tutte' : '⚠ ceduto'}</div>
+      <div class="stepper">
+        <button data-act="setHeld" data-d="-1">−</button>
+        <div class="val">${held}<small> / ${h.repsPerSet}</small></div>
+        <button data-act="setHeld" data-d="1">+</button>
+      </div>
+    </div>
+    <div class="setup-row">
+      <div class="label">RPE · sforzo percepito a fine serie</div>
+      <div class="rpe-grid">${rpeBtns}</div>
+      <p class="hint">Target ≈ ${s.rpeTarget}: ultima ripetizione dura ma tenuta tutta.</p>
+    </div>
+    ${st.last ? '<button class="cta" data-act="next">Concludi hangboard →</button>' : ''}`;
+}
 
 function viewCountdown(st) {
   const sec = Math.ceil(L.timerRemaining(run.timer, now()) / 1000);
@@ -527,7 +650,7 @@ function viewBoulderProject() {
   const tabs = b.projects.map((x, i) =>
     `<button class="tab ${i === run.projIdx ? 'on' : ''}" data-act="projTab" data-i="${i}">Progetto ${i + 1}${x.outcome === 'sent' ? ' ✓' : ''}</button>`).join('');
   return `<h1 class="step-title">Boulder al limite</h1>
-    <p class="muted center">1–2 progetti di livello ${s.projectLevel} · ${s.boulderAMin} min</p>
+    <p class="muted center">2 progetti di livello ${s.projectLevel} (massimo ${s.projectMax}) · ${s.boulderAMin} min</p>
     ${clockHtml('md')}
     <div class="note accent">📉 Smetti quando i tentativi peggiorano invece di migliorare.</div>
     ${restPanelHtml(`Dopo ogni tentativo tocca il pulsante: parte il recupero di ${L.formatClock(s.attemptRestSec * 1000)}.`)}
@@ -559,15 +682,17 @@ function viewBoulderVolume() {
   const lvl = run.volLevel ?? s.volumeLevel;
   const easier = Math.max(L.LEVEL_MIN, s.volumeLevel - 1);
   return `<h1 class="step-title">Boulder a volume</h1>
-    <p class="muted center">Obiettivo ${s.volumeTargetMin}–${s.volumeTargetMax} blocchi di livello ${s.volumeLevel}</p>
+    <p class="muted center">Obiettivo <b>${s.volumeTarget} blocchi</b> di livello ${s.volumeLevel} (da ${s.volumeTargetMin} a ${s.volumeTargetMax})</p>
     ${clockHtml('md')}
     <div class="vol-count">
-      <div><b>${v.total}</b><small>blocchi</small></div>
+      <div><b>${v.total}</b><small>di ${s.volumeTarget}</small></div>
       <div class="ok"><b>${v.sent}</b><small>chiusi</small></div>
       <div class="ko"><b>${v.notSent}</b><small>non chiusi</small></div>
     </div>
-    <div class="bar target ${prog.reachedMin ? 'reached' : ''}"><div style="width:${prog.pct}%"></div>
-      <span style="left:${Math.round((100 * s.volumeTargetMin) / s.volumeTargetMax)}%"></span></div>
+    <div class="bar target ${prog.reachedTarget ? 'reached' : ''}"><div style="width:${prog.pct}%"></div>
+      <span style="left:${prog.targetPct}%"></span></div>
+    ${prog.reachedMax ? `<div class="note accent">✋ ${s.volumeTargetMax} blocchi: volume completo, non serve aggiungerne altri.</div>`
+      : prog.reachedTarget ? '<div class="note">🎯 Obiettivo raggiunto: puoi chiudere qui o continuare se la qualità resta buona.</div>' : ''}
     ${restPanelHtml(`Ogni +1 avvia il recupero di ${L.formatClock(s.volumeRestSec * 1000)}.`)}
     <div class="label">Livello del prossimo blocco</div>
     ${levelChips(lvl, s.volumeLevel, 'volLevel')}
@@ -651,9 +776,19 @@ function sessionSummaryHtml(s) {
   parts.push(`<div class="sum-row"><b>Riscaldamento</b><span>${s.warmup?.done ? '✓ completato' : '—'}</span></div>`);
   if (s.hang) {
     const st = L.hangStats(s);
-    if (s.hang.skipped) parts.push(`<div class="sum-row"><b>Hangboard</b><span>saltato${s.hang.skipReason ? ' per scelta' : ''}</span></div>`);
-    else {
-      parts.push(`<div class="sum-row"><b>Hangboard</b><span>${s.hang.edgeMm} mm ${esc(s.hang.grip)} · ${esc(loadLabel(s.hang.addedKg))}${s.hang.interrupted ? ' · interrotto' : ''}</span></div>`);
+    const h = s.hang;
+    const hName = `Hangboard · ${L.HANG_PROTOCOLS[L.hangProtocol(s)]}`;
+    if (h.skipped) parts.push(`<div class="sum-row"><b>${hName}</b><span>saltato${h.skipReason ? ' per scelta' : ''}</span></div>`);
+    else if (L.hangProtocol(s) === 'repeaters') {
+      const rs = L.repeaterStats(s);
+      parts.push(`<div class="sum-row"><b>${hName}</b><span>${h.edgeMm} mm ${esc(h.grip)} · ${esc(loadLabel(h.addedKg))}${h.interrupted ? ' · interrotto' : ''}</span></div>`);
+      parts.push(`<div class="reps">${h.sets.map((x, i) => {
+        const held = L.setHeldReps(h, x);
+        return `<div class="rep ${!x.done ? 'skip' : held < h.repsPerSet ? 'fail' : ''}"><small>S${i + 1}</small>${x.done ? `${held}/${h.repsPerSet}` : '—'}<small>${x.done ? `RPE ${x.rpe}` : ''}</small></div>`;
+      }).join('')}</div>`);
+      if (rs) parts.push(`<p class="hint">${h.onSec} s / ${h.offSec} s · RPE medio ${L.round1(rs.avgRpe)} · ${rs.completedSets}/${rs.planned} serie complete · ${rs.totalReps} ripetizioni</p>`);
+    } else {
+      parts.push(`<div class="sum-row"><b>${hName}</b><span>${s.hang.edgeMm} mm ${esc(s.hang.grip)} · ${esc(loadLabel(s.hang.addedKg))}${s.hang.interrupted ? ' · interrotto' : ''}</span></div>`);
       parts.push(`<div class="reps">${s.hang.reps.map((r, i) =>
         `<div class="rep ${!r.done ? 'skip' : (r.heldS ?? r.targetS) < r.targetS ? 'fail' : ''}"><small>#${i + 1}</small>${r.done ? `${r.heldS ?? r.targetS}s` : '—'}<small>${r.done ? `RPE ${r.rpe}` : ''}</small></div>`).join('')}</div>`);
       if (st) parts.push(`<p class="hint">RPE medio ${L.round1(st.avgRpe)} · ${st.completed}/${st.planned} tenute complete</p>`);
@@ -714,7 +849,7 @@ function viewHome() {
   const s = state.settings;
   const t = now();
   const dl = L.deloadStatus(state, t);
-  const prog = L.progressionSuggestion(state, t);
+  const progs = [L.progressionSuggestion(state, t), L.repeaterSuggestion(state, t)].filter(Boolean);
   const last = state.sessions[state.sessions.length - 1];
   const cards = [];
 
@@ -729,15 +864,23 @@ function viewHome() {
       <button class="btn ghost" data-act="snoozeDeload">Più avanti</button></div></div>`);
   }
 
-  if (prog) {
-    const load = prog.options.find(o => o.type === 'load');
-    const edge = prog.options.find(o => o.type === 'edge');
-    cards.push(`<div class="card prog"><h3>📈 Pronto per progredire</h3>
-      <p>${Math.floor(prog.weeks)} settimane e ${prog.sessions} sessioni complete con RPE ≤ ${s.rpeTarget}. Scegli <b>una</b> delle due opzioni:</p>
+  for (const prog of progs) {
+    const rep = prog.target === 'rep';
+    const name = rep ? 'Repeaters' : 'Max Hangs';
+    const btn = o => {
+      const label = o.type === 'load' ? `Carico ${esc(L.fmtKg(o.fromKg))} → ${esc(L.fmtKg(o.toKg))} <small>(+${o.pct}%)</small>`
+        : o.type === 'edge' ? `Tacca ${o.fromMm} → ${o.toMm} mm`
+          : `Serie ${o.fromSets} → ${o.toSets}`;
+      return `<button class="btn primary" data-act="applyProg" data-target="${prog.target}" data-type="${o.type}">${label}</button>`;
+    };
+    const intro = prog.options.length > 1
+      ? `Scegli <b>una</b> delle due opzioni${rep ? ` (le serie ripartono da ${s.repMinSets})` : ''}:`
+      : prog.options[0].type === 'sets' ? 'Aggiungi una serie, con lo stesso carico e la stessa tacca:' : 'Proposta:';
+    cards.push(`<div class="card prog"><h3>📈 ${name}: pronto per progredire</h3>
+      <p>${Math.floor(prog.weeks)} settimane e ${prog.sessions} sessioni complete con RPE ≤ ${s.rpeTarget}. ${intro}</p>
       <div class="col">
-        <button class="btn primary" data-act="applyProg" data-type="load">Carico ${esc(L.fmtKg(load.fromKg))} → ${esc(L.fmtKg(load.toKg))} <small>(+${load.pct}%)</small></button>
-        ${edge ? `<button class="btn primary" data-act="applyProg" data-type="edge">Tacca ${edge.fromMm} → ${edge.toMm} mm</button>` : ''}
-        <button class="btn ghost" data-act="snoozeProg">Non ora</button>
+        ${prog.options.map(btn).join('')}
+        <button class="btn ghost" data-act="snoozeProg" data-target="${prog.target}">Non ora</button>
       </div></div>`);
   }
 
@@ -746,14 +889,14 @@ function viewHome() {
       <div><h1>Scheda arrampicata</h1>
       <p class="muted">${last ? `Ultima: ${fmtDate(last.date)} · ${esc((L.SESSION_TYPES[last.type] || L.SESSION_TYPES.U).short)}` : 'Nessuna sessione ancora'}</p></div>
     </header>`;
-  const common = `<p class="muted small center">Per entrambe: riscaldamento ${s.warmupMin} min · corpo libero ${s.bwRounds} giri · tacca ${s.edgeMm} mm · ${esc(L.fmtKg(s.addedKg))}</p>`;
+  const common = `<p class="muted small center">Per entrambe: riscaldamento ${s.warmupMin} min · corpo libero ${s.bwRounds} giri</p>`;
 
   // Settimana di scarico: una sola sessione possibile, niente scelta A/B.
   if (dl.active) {
     return `<div class="page">${hero}${cards.join('')}
       <div class="card plan">
         <div class="plan-row"><span>1</span><i class="pl">Riscaldamento</i> <b>${s.warmupMin} min</b></div>
-        <div class="plan-row off"><span>2</span><i class="pl">Max Hangs</i> <b>non in scarico</b></div>
+        <div class="plan-row off"><span>2</span><i class="pl">Hangboard</i> <b>non in scarico</b></div>
         <div class="plan-row"><span>3</span><i class="pl">Boulder facile</i> <b>${s.boulderMin} min</b></div>
         <div class="plan-row"><span>4</span><i class="pl">Corpo libero</i> <b>${s.bwRounds} giri</b></div>
       </div>
@@ -770,12 +913,12 @@ function viewHome() {
   return `<div class="page">${hero}${cards.join('')}
     <h3 class="section">Scegli la sessione di oggi</h3>
     ${choice('A', 'Limite', [
-      `Hangboard ridotto ${s.hangRepsA}×${s.hangSec}s`,
-      `Boulder al limite ${s.boulderAMin} min · progetti liv. ${s.projectLevel}`,
+      `Max Hangs ${s.hangRepsA}×${s.hangSec}s · ${s.edgeMm} mm · ${esc(L.fmtKg(s.addedKg))}`,
+      `Boulder al limite ${s.boulderAMin} min · 2 progetti liv. ${s.projectLevel} (max ${s.projectMax})`,
     ])}
     ${choice('B', 'Volume', [
-      `Hangboard completo ${s.hangReps}×${s.hangSec}s`,
-      `Boulder a volume ${s.boulderBMin} min · ${s.volumeTargetMin}–${s.volumeTargetMax} blocchi liv. ${s.volumeLevel}`,
+      `Repeaters ${s.repSets}×${s.repReps} (${s.repOnSec}/${s.repOffSec} s) · ${s.repEdgeMm} mm · ${esc(L.fmtKg(s.repAddedKg))}`,
+      `Boulder a volume ${s.boulderBMin} min · ${s.volumeTarget} blocchi liv. ${s.volumeLevel}`,
     ])}
     ${common}
   </div>`;
@@ -806,6 +949,16 @@ function viewHistory() {
     hangPts.push({ x: s.date, y: st.totalKg, tag: st.edgeMm !== prevEdge ? `${st.edgeMm}mm` : '' });
     prevEdge = st.edgeMm;
   }
+  // Repeaters: carico totale; l'etichetta segnala i cambi di tacca o di serie.
+  let prevCfg = null;
+  const repPts = [];
+  for (const s of sessions) {
+    const rs = L.repeaterStats(s);
+    if (!rs) continue;
+    const cfg = `${rs.edgeMm}mm ${rs.planned}×`;
+    repPts.push({ x: s.date, y: rs.totalKg, tag: cfg !== prevCfg ? cfg : '' });
+    prevCfg = cfg;
+  }
   const pullPts = sessions.map(s => ({ x: s.date, y: L.bwTotal(s, 'pullup') })).filter(p => p.y != null);
 
   const list = [...sessions].reverse().map(s => {
@@ -815,6 +968,8 @@ function viewHistory() {
     if (s.pain) chips.push('<span class="badge danger">🩹 dolore</span>');
     if (s.hang?.skipped) chips.push('<span class="badge">hangboard saltato</span>');
     if (st) chips.push(`<span class="badge">${st.edgeMm}mm · ${st.totalKg}kg · RPE ${L.round1(st.avgRpe)}</span>`);
+    const rs = L.repeaterStats(s);
+    if (rs) chips.push(`<span class="badge">repeaters ${rs.completedSets}/${rs.planned} serie · ${rs.edgeMm}mm · ${rs.totalKg}kg · RPE ${L.round1(rs.avgRpe)}</span>`);
     if (s.type === 'A' && s.boulder?.projects?.length) {
       const ps = L.projectStats(s);
       chips.push(`<span class="badge">progetti ${ps.sends}/${ps.projects} · ${ps.attempts} tent.</span>`);
@@ -844,7 +999,8 @@ function viewHistory() {
     <h1 class="page-title">Storico</h1>
     <div class="filters">${filters.map(([id, label]) =>
       `<button class="chip ${f === id ? 'on' : ''}" data-act="histFilter" data-v="${id}">${label}</button>`).join('')}</div>
-    <div class="card"><h3>Hangboard · carico totale (kg)</h3>${lineChart(hangPts, { unit: 'kg' })}</div>
+    ${f !== 'B' || hangPts.length ? `<div class="card"><h3>Max Hangs · carico totale (kg)</h3>${lineChart(hangPts, { unit: 'kg' })}</div>` : ''}
+    ${f !== 'A' || repPts.length ? `<div class="card"><h3>Repeaters · carico totale (kg)</h3>${lineChart(repPts, { unit: 'kg', color: 'var(--blue)' })}</div>` : ''}
     ${chartA}${chartB}
     <div class="card"><h3>Trazioni · ripetizioni totali</h3>${lineChart(pullPts, { unit: 'rip', color: 'var(--blue)' })}</div>
     ${events && f === 'all' ? `<div class="card"><h3>Eventi</h3><ul class="events">${events}</ul></div>` : ''}
@@ -882,23 +1038,39 @@ const SETTINGS_FORM = [
     ['projectLevel', 'Livello progetto', '', 1],
   ]],
   ['Sessione A · Limite', [
-    ['hangRepsA', 'Sospensioni hangboard', '', 1],
     ['boulderAMin', 'Boulder al limite', 'min', 1],
     ['attemptRestSec', 'Recupero tra tentativi', 's', 15],
+    ['projectMax', 'Progetti massimi per sessione', '', 1],
   ]],
-  ['Sessione B · Volume', [
-    ['hangReps', 'Sospensioni hangboard', '', 1],
-    ['boulderBMin', 'Boulder a volume', 'min', 1],
-    ['volumeRestSec', 'Recupero tra blocchi', 's', 15],
-    ['volumeTargetMin', 'Obiettivo blocchi (min)', '', 1],
-    ['volumeTargetMax', 'Obiettivo blocchi (max)', '', 1],
-  ]],
-  ['Hangboard', [
+  ['Max Hangs (Sessione A)', [
+    ['hangRepsA', 'Sospensioni', '', 1],
     ['hangSec', 'Durata sospensione', 's', 1],
     ['hangRestSec', 'Recupero', 's', 15],
-    ['countdownSec', 'Conto alla rovescia', 's', 1],
     ['edgeMm', 'Tacca', 'mm', 1],
     ['addedKg', 'Carico (+ zavorra / − alleggerimento)', 'kg', 0.5],
+    ['grip', 'Presa', 'text'],
+  ]],
+  ['Sessione B · Volume', [
+    ['boulderBMin', 'Boulder a volume', 'min', 1],
+    ['volumeRestSec', 'Recupero tra blocchi', 's', 15],
+    ['volumeTarget', 'Obiettivo blocchi', '', 1],
+    ['volumeTargetMin', 'Blocchi minimi', '', 1],
+    ['volumeTargetMax', 'Blocchi massimi', '', 1],
+  ]],
+  ['Repeaters (Sessione B)', [
+    ['repSets', 'Serie attuali', '', 1],
+    ['repMinSets', 'Serie di partenza', '', 1],
+    ['repMaxSets', 'Serie massime (poi carico o tacca)', '', 1],
+    ['repReps', 'Ripetizioni per serie', '', 1],
+    ['repOnSec', 'Appeso', 's', 1],
+    ['repOffSec', 'Riposo tra ripetizioni', 's', 1],
+    ['repSetRestSec', 'Recupero tra le serie', 's', 15],
+    ['repEdgeMm', 'Tacca', 'mm', 1],
+    ['repAddedKg', 'Carico (+ zavorra / − alleggerimento)', 'kg', 0.5],
+    ['repGrip', 'Presa', 'text'],
+  ]],
+  ['Hangboard (comune)', [
+    ['countdownSec', 'Conto alla rovescia', 's', 1],
     ['rpeTarget', 'RPE target', '', 1],
   ]],
   ['Settimana di scarico', [
@@ -921,11 +1093,12 @@ const SETTINGS_FORM = [
 function viewSettings() {
   const s = state.settings;
   const groups = SETTINGS_FORM.map(([title, fields]) => `<div class="card"><h3>${title}</h3>
-    ${fields.map(([key, label, unit, stepV]) => `<label class="field">
+    ${fields.map(([key, label, unit, stepV]) => unit === 'text'
+      ? `<label class="field"><span>${label}</span><span class="inp"><input type="text" data-setting="${key}" value="${esc(s[key])}"></span></label>`
+      : `<label class="field">
       <span>${label}</span>
       <span class="inp"><input type="number" inputmode="decimal" step="${stepV}" data-setting="${key}" value="${s[key]}">${unit ? `<em>${unit}</em>` : ''}</span>
     </label>`).join('')}
-    ${title === 'Hangboard' ? `<label class="field"><span>Presa</span><span class="inp"><input type="text" data-setting="grip" value="${esc(s.grip)}"></span></label>` : ''}
   </div>`).join('');
 
   const notif = 'Notification' in window ? Notification.permission : 'unsupported';
@@ -945,7 +1118,7 @@ function viewSettings() {
         <button class="btn danger" data-act="resetAll">Cancella tutti i dati</button>
       </div>
     </div>
-    <p class="muted center small">Scheda arrampicata · v2.0 (sessioni A/B)</p>
+    <p class="muted center small">Scheda arrampicata · v3.0 (Max Hangs + Repeaters)</p>
   </div>`;
 }
 
@@ -1032,9 +1205,17 @@ const actions = {
   // --- boulder A ---
   projTab: el => { run.projIdx = Number(el.dataset.i); persistRun(); render(); },
   projAdd: () => {
-    run.session.boulder.projects.push(L.newProject(state.settings));
-    run.projIdx = run.session.boulder.projects.length - 1;
-    persistRun(); render();
+    const add = () => {
+      run.session.boulder.projects.push(L.newProject(state.settings));
+      run.projIdx = run.session.boulder.projects.length - 1;
+      persistRun(); render();
+    };
+    if (!L.projectLimitReached(run.session, state.settings)) { add(); return; }
+    const n = run.session.boulder.projects.length;
+    modal(`Già ${n} progetti oggi`, `Nella sessione al limite conviene concentrarsi su 2 progetti, al massimo ${state.settings.projectMax}: con troppi blocchi i tentativi buoni si disperdono. Aggiungerne un altro?`, [
+      { label: 'Resto su questi', cls: 'primary' },
+      { label: 'Aggiungi comunque', cls: 'ghost', fn: add },
+    ]);
   },
   projLevel: el => { curProject().level = L.clampLevel(el.dataset.v); persistRun(); render(); },
   projOutcome: el => {
@@ -1089,7 +1270,16 @@ const actions = {
     persistRun(); render();
   },
   rpe: el => {
-    run.session.hang.reps[step().rep].rpe = Number(el.dataset.v);
+    const st = step();
+    const target = st.set != null ? run.session.hang.sets[st.set] : run.session.hang.reps[st.rep];
+    target.rpe = Number(el.dataset.v);
+    persistRun(); render();
+  },
+  setHeld: el => {
+    const h = run.session.hang;
+    const x = h.sets[step().set];
+    x.heldReps = clamp(L.setHeldReps(h, x) + Number(el.dataset.d), 0, h.repsPerSet);
+    x.done = true;
     persistRun(); render();
   },
   held: el => {
@@ -1133,14 +1323,15 @@ const actions = {
     { label: 'Annulla', cls: 'ghost' },
   ]),
   applyProg: el => {
-    const sug = L.progressionSuggestion(state, now());
+    const rep = el.dataset.target === 'rep';
+    const sug = rep ? L.repeaterSuggestion(state, now()) : L.progressionSuggestion(state, now());
     const opt = sug?.options.find(o => o.type === el.dataset.type);
     if (!opt) return;
     state = L.applyProgression(state, opt, now());
     persist();
     toast('📈 Progressione applicata');
   },
-  snoozeProg: () => { state = L.snoozeProgression(state, now()); persist(); render(); },
+  snoozeProg: el => { state = L.snoozeProgression(state, now(), el.dataset.target); persist(); render(); },
   // --- navigazione / storico ---
   nav: el => { ui.screen = el.dataset.to; render(); window.scrollTo(0, 0); },
   detail: el => { ui.detailId = el.dataset.id; ui.screen = 'detail'; render(); },
@@ -1193,7 +1384,10 @@ document.addEventListener('change', async e => {
       const v = parseFloat(el.value.replace(',', '.'));
       if (Number.isNaN(v)) { render(); return; }
       // I livelli seguono la scala della palestra (1–7)
-      state.settings[key] = ['volumeLevel', 'projectLevel'].includes(key) ? L.clampLevel(v) : v;
+      // Conteggi (serie, ripetizioni, progetti, secondi dei repeaters): interi e almeno 1
+      const counts = ['repSets', 'repMinSets', 'repMaxSets', 'repReps', 'repOnSec', 'repOffSec', 'projectMax', 'hangRepsA', 'volumeTarget'];
+      state.settings[key] = ['volumeLevel', 'projectLevel'].includes(key) ? L.clampLevel(v)
+        : counts.includes(key) ? Math.max(1, Math.round(v)) : v;
       if (state.settings[key] !== v) el.value = state.settings[key];
     } else {
       state.settings[key] = el.value.trim() || L.defaultSettings()[key];

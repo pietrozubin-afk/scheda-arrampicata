@@ -18,28 +18,42 @@ export function defaultSettings() {
     // Riscaldamento
     warmupMin: 10,
     warmupBlocks: 6,         // blocchi facili progressivi
-    // Hangboard (Max Hangs)
-    hangReps: 5,
+    // Hangboard: valori comuni ai due metodi
+    countdownSec: 3,         // conto alla rovescia 3-2-1
+    rpeTarget: 8,
+    // Max Hangs (Sessione A): sospensioni brevi al massimo carico
+    hangReps: 5,             // solo per eventuali sessioni non classificate
     hangSec: 10,
     hangRestSec: 180,        // recupero tra sospensioni (2–3 min)
-    countdownSec: 3,         // conto alla rovescia 3-2-1
     edgeMm: 20,              // tacca
     grip: 'Half crimp',
     addedKg: 0,              // >0 zavorra, <0 alleggerimento (elastico/carrucola)
-    rpeTarget: 8,
+    // Repeaters (Sessione B): 7 s appeso / 3 s riposo × 6, per serie
+    repSets: 3,              // serie attuali (la progressione le aumenta)
+    repMinSets: 3,           // si riparte da qui dopo un aumento di carico o tacca
+    repMaxSets: 5,           // raggiunte queste, si propone carico o tacca
+    repReps: 6,              // ripetizioni per serie
+    repOnSec: 7,             // secondi appeso
+    repOffSec: 3,            // secondi di riposo tra le ripetizioni
+    repSetRestSec: 180,      // recupero tra le serie (2–3 min)
+    repEdgeMm: 20,
+    repGrip: 'Half crimp',
+    repAddedKg: 0,
     // Boulder (sessione di scarico / sessioni non classificate)
     boulderMin: 30,
     boulderLimitMin: 15,     // primi minuti dedicati ai blocchi al limite (solo sessioni vecchie)
     // Sessione A – Limite
-    hangRepsA: 3,            // hangboard ridotto
+    hangRepsA: 5,            // Max Hangs: è l'unico giorno di forza massima
     boulderAMin: 35,         // boulder al limite 30–40 min
     attemptRestSec: 180,     // recupero tra tentativi 3–4 min
     projectLevel: 5,         // livello dei progetti (scala palestra 1–7)
-    // Sessione B – Volume (hangReps sopra = 5 sospensioni)
-    boulderBMin: 30,
+    projectMax: 3,           // oltre, l'app chiede conferma (consigliati 2)
+    // Sessione B – Volume
+    boulderBMin: 40,
     volumeRestSec: 90,       // recupero tra blocchi 1–2 min
-    volumeTargetMin: 12,     // obiettivo 12–20 blocchi
-    volumeTargetMax: 20,
+    volumeTarget: 15,        // obiettivo blocchi
+    volumeTargetMin: 12,     // minimo utile
+    volumeTargetMax: 20,     // massimo: oltre è troppo
     volumeLevel: 4,          // livello dei blocchi a volume
     // Corpo libero
     bwRounds: 3,
@@ -77,8 +91,8 @@ export const WARMUP_MOBILITY = ['Mobilità spalle', 'Mobilità polsi e dita'];
 
 // ---------------------------------------------------------------------
 // TIPI DI SESSIONE
-//   A = Limite (hangboard ridotto + progetti)
-//   B = Volume (hangboard completo + tanti blocchi)
+//   A = Limite (hangboard Max Hangs + progetti)
+//   B = Volume (hangboard Repeaters 7/3 + tanti blocchi)
 //   S = Scarico (niente hangboard, boulder facile)
 //   U = Non classificata (sessioni salvate prima dell'introduzione di A/B)
 // ---------------------------------------------------------------------
@@ -119,9 +133,27 @@ export function warmupItems(settings, type) {
   return items;
 }
 
+// Metodo di hangboard di ogni tipo di sessione:
+//   'max'       = Max Hangs (sospensioni da 10 s al carico massimo)
+//   'repeaters' = 7 s appeso / 3 s riposo ripetuti, in più serie
+//   null        = niente hangboard (scarico)
+export const HANG_PROTOCOLS = { max: 'Max Hangs', repeaters: 'Repeaters' };
+
+export function hangProtocolFor(type) {
+  if (type === 'S') return null;
+  return type === 'B' ? 'repeaters' : 'max';
+}
+
+// Numero di sospensioni Max Hangs (0 se la sessione non le prevede).
 export function hangRepsFor(settings, type) {
-  if (type === 'S') return 0;
+  if (hangProtocolFor(type) !== 'max') return 0;
   return type === 'A' ? settings.hangRepsA : settings.hangReps;
+}
+
+// Metodo usato da una sessione salvata (le sessioni vecchie erano tutte Max Hangs).
+export function hangProtocol(session) {
+  if (!session?.hang) return null;
+  return session.hang.protocol || 'max';
 }
 
 export function boulderMinFor(settings, type) {
@@ -131,7 +163,7 @@ export function boulderMinFor(settings, type) {
 }
 
 // Stato iniziale dell'app al primo avvio.
-export const STATE_VERSION = 2;
+export const STATE_VERSION = 3;
 
 export function initialState(now) {
   return {
@@ -140,7 +172,8 @@ export function initialState(now) {
     settings: defaultSettings(),
     sessions: [],
     events: [],              // {ts, type: 'pain'|'progression'|'deload', text}
-    progression: { lastChangeAt: now, snoozeUntil: 0 },
+    progression: { lastChangeAt: now, snoozeUntil: 0 },     // Max Hangs
+    progressionRep: { lastChangeAt: now, snoozeUntil: 0 },  // Repeaters
     deload: { lastEndAt: now, activeUntil: 0, snoozeUntil: 0 },
   };
 }
@@ -155,6 +188,8 @@ export function normalizeState(raw, now) {
     ...raw,
     settings: { ...base.settings, ...(raw.settings || {}) },
     progression: { ...base.progression, ...(raw.progression || {}) },
+    // Chi arriva da una versione senza repeaters parte da oggi (o dalla data del backup).
+    progressionRep: { ...base.progressionRep, ...(raw.progressionRep || {}) },
     deload: { ...base.deload, ...(raw.deload || {}) },
     sessions: Array.isArray(raw.sessions) ? raw.sessions : [],
     events: Array.isArray(raw.events) ? raw.events : [],
@@ -168,13 +203,19 @@ export function normalizeState(raw, now) {
 //   - le sessioni esistenti diventano "non classificate" (U),
 //     quelle fatte in settimana di scarico diventano "Scarico" (S);
 //   - il boulder riceve i nuovi campi (progetti e registro volume) vuoti.
+// v2 -> v3: introduzione dei repeaters nella Sessione B.
+//   - l'hangboard delle sessioni esistenti viene marcato come Max Hangs
+//     (protocol: 'max'), perché fino ad allora era l'unico metodo;
+//   - impostazioni: la Sessione A passa da 3 a 5 Max Hangs e il boulder a
+//     volume da 30 a 40 min, ma solo se erano ancora ai vecchi valori
+//     predefiniti (una scelta personale non viene toccata).
 // Nessun dato esistente viene cancellato o modificato.
 // ---------------------------------------------------------------------
 export function migrateSession(s) {
   if (!s || typeof s !== 'object') return s;
   const type = SESSION_TYPES[s.type] ? s.type : (s.deload ? 'S' : 'U');
   const boulder = s.boulder || { elapsedMs: 0, notes: '' };
-  return {
+  const out = {
     ...s,
     type,
     boulder: {
@@ -183,12 +224,24 @@ export function migrateSession(s) {
       log: Array.isArray(boulder.log) ? boulder.log : [],
     },
   };
+  if (s.hang && !s.hang.protocol) out.hang = { ...s.hang, protocol: 'max' };
+  return out;
+}
+
+function sessionIsCurrent(s) {
+  return !!SESSION_TYPES[s.type] && (!s.hang || !!s.hang.protocol);
 }
 
 export function migrateState(st) {
   const from = Number(st.version) || 1;
-  if (from >= STATE_VERSION && st.sessions.every(s => SESSION_TYPES[s.type])) return st;
-  return { ...st, version: STATE_VERSION, sessions: st.sessions.map(migrateSession) };
+  if (from >= STATE_VERSION && st.sessions.every(sessionIsCurrent)) return st;
+  let settings = st.settings;
+  if (from < 3) {
+    settings = { ...settings };
+    if (settings.hangRepsA === 3) settings.hangRepsA = 5;
+    if (settings.boulderBMin === 30) settings.boulderBMin = 40;
+  }
+  return { ...st, version: STATE_VERSION, settings, sessions: st.sessions.map(migrateSession) };
 }
 
 // Sessione in corso salvata da una versione precedente dell'app.
@@ -284,7 +337,23 @@ export function buildSteps(settings, opts = {}) {
   steps.push({ kind: 'warmup', durationMs: s.warmupMin * MIN, auto: false });
 
   const reps = hangRepsFor(s, type);
-  if (reps > 0) {
+  if (hangProtocolFor(type) === 'repeaters') {
+    steps.push({ kind: 'hangConfirm' });
+    steps.push({ kind: 'hangSetup' });
+    const sets = Math.max(1, s.repSets);
+    const n = Math.max(1, s.repReps);
+    for (let set = 0; set < sets; set++) {
+      steps.push({ kind: 'hangSetCountdown', set, durationMs: s.countdownSec * SEC, auto: true });
+      for (let rep = 0; rep < n; rep++) {
+        steps.push({ kind: 'hangOn', set, rep, durationMs: s.repOnSec * SEC, auto: true });
+        // Dopo l'ultima ripetizione non c'è il riposo breve: parte il recupero della serie.
+        if (rep < n - 1) steps.push({ kind: 'hangOff', set, rep, durationMs: s.repOffSec * SEC, auto: true });
+      }
+      steps.push(set === sets - 1
+        ? { kind: 'hangSetRest', set, last: true }
+        : { kind: 'hangSetRest', set, durationMs: s.repSetRestSec * SEC, auto: true });
+    }
+  } else if (reps > 0) {
     steps.push({ kind: 'hangConfirm' });
     steps.push({ kind: 'hangSetup' });
     for (let rep = 0; rep < reps; rep++) {
@@ -311,7 +380,13 @@ export function buildSteps(settings, opts = {}) {
 }
 
 export function isHangStep(step) {
-  return !!step && ['hangSetup', 'hangCountdown', 'hang', 'hangRest'].includes(step.kind);
+  return !!step && ['hangSetup', 'hangCountdown', 'hang', 'hangRest',
+    'hangSetCountdown', 'hangOn', 'hangOff', 'hangSetRest'].includes(step.kind);
+}
+
+// Passi di una serie di repeaters (per Ripeti / Salta / Ceduto).
+export function isRepeaterStep(step) {
+  return !!step && ['hangSetCountdown', 'hangOn', 'hangOff', 'hangSetRest'].includes(step.kind);
 }
 
 // Indice del primo passo di un certo tipo (con filtro opzionale).
@@ -337,13 +412,34 @@ export function newSession(state, now, opts = {}) {
   const s = state.settings;
   const type = resolveType(opts);
   const deload = type === 'S';
-  const prevHang = lastSession(state, x => x.hang && !x.hang.skipped && x.hang.reps.length);
+  const protocol = hangProtocolFor(type);
+  // L'RPE si precompila dall'ultima sessione fatta con lo stesso metodo.
+  const prevHang = lastSession(state, x => hangProtocol(x) === protocol && !x.hang.skipped &&
+    (protocol === 'repeaters' ? x.hang.sets?.length : x.hang.reps?.length));
   const prevBw = lastSession(state, x => x.bodyweight && x.bodyweight.rounds.length);
 
-  const hangReps = [];
-  for (let i = 0; i < hangRepsFor(s, type); i++) {
-    const prevRpe = prevHang?.hang.reps[i]?.rpe;
-    hangReps.push({ targetS: s.hangSec, heldS: null, rpe: prevRpe ?? s.rpeTarget, done: false });
+  let hang = null;
+  if (protocol === 'max') {
+    const reps = [];
+    for (let i = 0; i < hangRepsFor(s, type); i++) {
+      const prevRpe = prevHang?.hang.reps[i]?.rpe;
+      reps.push({ targetS: s.hangSec, heldS: null, rpe: prevRpe ?? s.rpeTarget, done: false });
+    }
+    hang = {
+      protocol, edgeMm: s.edgeMm, grip: s.grip, bodyKg: s.bodyKg, addedKg: s.addedKg,
+      reps, interrupted: null, skipped: false,
+    };
+  } else if (protocol === 'repeaters') {
+    const sets = [];
+    for (let i = 0; i < s.repSets; i++) {
+      // heldReps: ripetizioni tenute nella serie (null = tutte)
+      sets.push({ heldReps: null, rpe: prevHang?.hang.sets[i]?.rpe ?? s.rpeTarget, done: false });
+    }
+    hang = {
+      protocol, edgeMm: s.repEdgeMm, grip: s.repGrip, bodyKg: s.bodyKg, addedKg: s.repAddedKg,
+      repsPerSet: s.repReps, onSec: s.repOnSec, offSec: s.repOffSec,
+      sets, interrupted: null, skipped: false,
+    };
   }
 
   const rounds = [];
@@ -365,15 +461,7 @@ export function newSession(state, now, opts = {}) {
     deload,
     pain: false,
     warmup: { done: false, checks: Array(warmupItems(s, type).length).fill(false) },
-    hang: deload ? null : {
-      edgeMm: s.edgeMm,
-      grip: s.grip,
-      bodyKg: s.bodyKg,
-      addedKg: s.addedKg,
-      reps: hangReps,
-      interrupted: null,
-      skipped: false,
-    },
+    hang,
     boulder: {
       elapsedMs: 0,
       notes: '',
@@ -411,6 +499,11 @@ export function projectStats(session) {
   };
 }
 
+// Limite consigliato di progetti per sessione: oltre, l'app chiede conferma.
+export function projectLimitReached(session, settings) {
+  return (session?.boulder?.projects?.length || 0) >= settings.projectMax;
+}
+
 // ---------------------------------------------------------------------
 // BOULDER B – contatore volume
 // ---------------------------------------------------------------------
@@ -435,14 +528,17 @@ export function volumeStats(session) {
   return { total: log.length, sent, notSent: log.length - sent, byLevel };
 }
 
-// Avanzamento verso l'obiettivo 12–20 blocchi (contano tutti i blocchi provati).
+// Avanzamento verso l'obiettivo (15, tra 12 e 20): contano tutti i blocchi provati.
 export function volumeProgress(session, settings) {
   const { total } = volumeStats(session);
+  const max = Math.max(1, settings.volumeTargetMax);
   return {
     total,
     reachedMin: total >= settings.volumeTargetMin,
+    reachedTarget: total >= settings.volumeTarget,
     reachedMax: total >= settings.volumeTargetMax,
-    pct: Math.min(100, Math.round((100 * total) / settings.volumeTargetMax)),
+    pct: Math.min(100, Math.round((100 * total) / max)),
+    targetPct: Math.min(100, Math.round((100 * settings.volumeTarget) / max)),
   };
 }
 
@@ -455,10 +551,11 @@ export function restTimerFor(settings, type, now) {
   return createTimer(sec * SEC, now);
 }
 
-// Statistiche hangboard di una sessione (per storico e progressione).
+// Statistiche Max Hangs di una sessione (per storico e progressione).
+// Per le sessioni con i repeaters usare repeaterStats.
 export function hangStats(session) {
   const h = session?.hang;
-  if (!h || h.skipped) return null;
+  if (!h || h.skipped || hangProtocol(session) !== 'max' || !Array.isArray(h.reps)) return null;
   const done = h.reps.filter(r => r.done);
   if (!done.length) return null;
   const completed = done.filter(r => (r.heldS ?? r.targetS) >= r.targetS).length;
@@ -469,6 +566,32 @@ export function hangStats(session) {
     completed,
     allCompleted: completed === h.reps.length,
     avgRpe,
+    totalKg: round1(h.bodyKg + h.addedKg),
+    addedKg: h.addedKg,
+    edgeMm: h.edgeMm,
+  };
+}
+
+// Ripetizioni tenute in una serie di repeaters (null = tutte quelle previste).
+export function setHeldReps(hang, set) {
+  return set.heldReps ?? hang.repsPerSet;
+}
+
+// Statistiche repeaters di una sessione (per storico e progressione).
+export function repeaterStats(session) {
+  const h = session?.hang;
+  if (!h || h.skipped || hangProtocol(session) !== 'repeaters' || !Array.isArray(h.sets)) return null;
+  const done = h.sets.filter(x => x.done);
+  if (!done.length) return null;
+  const completedSets = done.filter(x => setHeldReps(h, x) >= h.repsPerSet).length;
+  return {
+    sets: done.length,
+    planned: h.sets.length,
+    completedSets,
+    allCompleted: completedSets === h.sets.length,
+    totalReps: done.reduce((a, x) => a + setHeldReps(h, x), 0),
+    repsPerSet: h.repsPerSet,
+    avgRpe: done.reduce((a, x) => a + (Number(x.rpe) || 0), 0) / done.length,
     totalKg: round1(h.bodyKg + h.addedKg),
     addedKg: h.addedKg,
     edgeMm: h.edgeMm,
@@ -499,73 +622,126 @@ export function round1(x) {
   return Math.round(x * 10) / 10;
 }
 
-export function progressionSuggestion(state, now) {
+// Controlli comuni ai due metodi: rimandata, scarico, tempo minimo, dolore.
+// Restituisce la data dell'ultimo cambio e le settimane trascorse, o null.
+function progressionWindow(state, p, now) {
   const s = state.settings;
-  const p = state.progression;
   if (p.snoozeUntil && p.snoozeUntil > now) return null;
   if (deloadStatus(state, now).active) return null;
-
   const since = p.lastChangeAt ?? state.programStart;
   const weeks = (now - since) / WEEK;
   if (weeks < s.progressionMinWeeks) return null;
-
   // Un dolore alle dita dopo l'ultimo cambio blocca la progressione.
   if (state.events.some(e => e.type === 'pain' && e.ts >= since)) return null;
+  return { since, weeks };
+}
 
-  // Sessioni valide: A e B (e le vecchie non classificate) dopo l'ultimo cambio,
-  // con la configurazione attuale. Le sessioni A con hangboard saltato non contano.
-  const relevant = state.sessions.filter(x =>
-    x.date >= since && !x.deload && x.type !== 'S' && !x.pain && x.hang && !x.hang.skipped &&
-    x.hang.edgeMm === s.edgeMm && x.hang.addedKg === s.addedKg && hangStats(x));
+// Sessioni utili alla progressione: dopo l'ultimo cambio, niente scarico,
+// niente dolore, hangboard non saltato.
+function progressionCandidates(state, since) {
+  return state.sessions.filter(x =>
+    x.date >= since && !x.deload && x.type !== 'S' && !x.pain && x.hang && !x.hang.skipped);
+}
+
+// Le due opzioni alternative: +2–5% di carico OPPURE tacca −2 mm.
+function loadOrEdgeOptions(s, addedKg, edgeMm) {
+  const totalKg = s.bodyKg + addedKg;
+  const minInc = Math.max(0.5, roundHalf(totalKg * 0.02));
+  const maxInc = Math.max(minInc, roundHalf(totalKg * 0.05));
+  const inc = Math.min(maxInc, Math.max(minInc, roundHalf(totalKg * 0.03)));
+  const options = [{
+    type: 'load',
+    fromKg: addedKg,
+    toKg: round1(addedKg + inc),
+    deltaKg: inc,
+    pct: round1((inc / totalKg) * 100),
+  }];
+  const newEdge = edgeMm - s.edgeStepMm;
+  if (newEdge >= s.minEdgeMm) options.push({ type: 'edge', fromMm: edgeMm, toMm: newEdge });
+  return options;
+}
+
+// MAX HANGS: contano tutte le sessioni fatte con le Max Hangs (oggi le A,
+// prima dei repeaters anche le B e le non classificate) con la configurazione attuale.
+export function progressionSuggestion(state, now) {
+  const s = state.settings;
+  const win = progressionWindow(state, state.progression, now);
+  if (!win) return null;
+
+  const relevant = progressionCandidates(state, win.since).filter(x =>
+    hangProtocol(x) === 'max' && x.hang.edgeMm === s.edgeMm && x.hang.addedKg === s.addedKg && hangStats(x));
   if (relevant.length < s.progressionMinSessions) return null;
 
   // Le ultime 2 devono essere complete e non oltre l'RPE target.
   const lastTwo = relevant.slice(-2).map(hangStats);
-  const ready = lastTwo.every(st => st.allCompleted && st.avgRpe <= s.rpeTarget);
-  if (!ready) return null;
+  if (!lastTwo.every(st => st.allCompleted && st.avgRpe <= s.rpeTarget)) return null;
 
-  const totalKg = s.bodyKg + s.addedKg;
-  const minInc = Math.max(0.5, roundHalf(totalKg * 0.02));
-  const maxInc = Math.max(minInc, roundHalf(totalKg * 0.05));
-  const inc = Math.min(maxInc, Math.max(minInc, roundHalf(totalKg * 0.03)));
-
-  const options = [{
-    type: 'load',
-    fromKg: s.addedKg,
-    toKg: round1(s.addedKg + inc),
-    deltaKg: inc,
-    pct: round1((inc / totalKg) * 100),
-  }];
-  const newEdge = s.edgeMm - s.edgeStepMm;
-  if (newEdge >= s.minEdgeMm) {
-    options.push({ type: 'edge', fromMm: s.edgeMm, toMm: newEdge });
-  }
-  return { weeks: round1(weeks), sessions: relevant.length, options };
+  const options = loadOrEdgeOptions(s, s.addedKg, s.edgeMm).map(o => ({ ...o, target: 'max' }));
+  return { target: 'max', weeks: round1(win.weeks), sessions: relevant.length, options };
 }
 
-// Applica UNA sola opzione di progressione: cambia o il carico o la tacca.
-export function applyProgression(state, option, now) {
-  const settings = { ...state.settings };
-  let text;
-  if (option.type === 'load') {
-    settings.addedKg = option.toKg;
-    text = `Carico: ${fmtKg(option.fromKg)} → ${fmtKg(option.toKg)} (tacca invariata ${settings.edgeMm} mm)`;
-  } else if (option.type === 'edge') {
-    settings.edgeMm = option.toMm;
-    text = `Tacca: ${option.fromMm} → ${option.toMm} mm (carico invariato ${fmtKg(settings.addedKg)})`;
-  } else {
-    throw new Error('Opzione di progressione sconosciuta');
-  }
+// REPEATERS: prima si aggiunge una serie (da 3 fino a 5); arrivati al massimo
+// delle serie si propone +carico OPPURE −tacca, e le serie ripartono da 3.
+export function repeaterSuggestion(state, now) {
+  const s = state.settings;
+  const win = progressionWindow(state, state.progressionRep, now);
+  if (!win) return null;
+
+  const relevant = progressionCandidates(state, win.since).filter(x =>
+    hangProtocol(x) === 'repeaters' && x.hang.edgeMm === s.repEdgeMm && x.hang.addedKg === s.repAddedKg &&
+    x.hang.sets.length === s.repSets && x.hang.repsPerSet === s.repReps && repeaterStats(x));
+  if (relevant.length < s.progressionMinSessions) return null;
+
+  const lastTwo = relevant.slice(-2).map(repeaterStats);
+  if (!lastTwo.every(st => st.allCompleted && st.avgRpe <= s.rpeTarget)) return null;
+
+  const options = s.repSets < s.repMaxSets
+    ? [{ type: 'sets', fromSets: s.repSets, toSets: s.repSets + 1 }]
+    : loadOrEdgeOptions(s, s.repAddedKg, s.repEdgeMm);
   return {
-    ...state,
-    settings,
-    progression: { ...state.progression, lastChangeAt: now, snoozeUntil: 0 },
-    events: [...state.events, { ts: now, type: 'progression', text }],
+    target: 'rep', weeks: round1(win.weeks), sessions: relevant.length,
+    options: options.map(o => ({ ...o, target: 'rep' })),
   };
 }
 
-export function snoozeProgression(state, now) {
-  return { ...state, progression: { ...state.progression, snoozeUntil: now + WEEK } };
+// Applica UNA sola opzione di progressione: cambia o il carico o la tacca
+// (o, per i repeaters, il numero di serie). Mai carico e tacca insieme.
+export function applyProgression(state, option, now) {
+  const settings = { ...state.settings };
+  const rep = option.target === 'rep';
+  const kgKey = rep ? 'repAddedKg' : 'addedKg';
+  const edgeKey = rep ? 'repEdgeMm' : 'edgeMm';
+  let text;
+  if (option.type === 'load') {
+    settings[kgKey] = option.toKg;
+    text = `Carico: ${fmtKg(option.fromKg)} → ${fmtKg(option.toKg)} (tacca invariata ${settings[edgeKey]} mm)`;
+  } else if (option.type === 'edge') {
+    settings[edgeKey] = option.toMm;
+    text = `Tacca: ${option.fromMm} → ${option.toMm} mm (carico invariato ${fmtKg(settings[kgKey])})`;
+  } else if (option.type === 'sets' && rep) {
+    settings.repSets = option.toSets;
+    text = `Serie: ${option.fromSets} → ${option.toSets} (carico e tacca invariati)`;
+  } else {
+    throw new Error('Opzione di progressione sconosciuta');
+  }
+  // Con più carico o tacca più piccola i repeaters ripartono dal numero minimo di serie.
+  if (rep && option.type !== 'sets') {
+    settings.repSets = settings.repMinSets;
+    text += `, serie riportate a ${settings.repMinSets}`;
+  }
+  const key = rep ? 'progressionRep' : 'progression';
+  return {
+    ...state,
+    settings,
+    [key]: { ...state[key], lastChangeAt: now, snoozeUntil: 0 },
+    events: [...state.events, { ts: now, type: 'progression', text: `${rep ? 'Repeaters' : 'Max Hangs'} · ${text}` }],
+  };
+}
+
+// target: 'max' (Max Hangs) oppure 'rep' (repeaters)
+export function snoozeProgression(state, now, target = 'max') {
+  const key = target === 'rep' ? 'progressionRep' : 'progression';
+  return { ...state, [key]: { ...state[key], snoozeUntil: now + WEEK } };
 }
 
 // ---------------------------------------------------------------------
@@ -593,6 +769,7 @@ export function startDeload(state, now) {
     deload: { ...state.deload, activeUntil: until, lastEndAt: until, snoozeUntil: 0 },
     // Dopo lo scarico il conteggio della progressione riparte.
     progression: { ...state.progression, lastChangeAt: until },
+    progressionRep: { ...state.progressionRep, lastChangeAt: until },
     events: [...state.events, { ts: now, type: 'deload', text: 'Inizio settimana di scarico' }],
   };
 }
@@ -635,7 +812,14 @@ export function toCSV(state) {
     const r0 = (...cols) => rows.push([d, s.id, s.type, ...cols]);
     if (s.warmup) r0('riscaldamento', 'riscaldamento', '', s.warmup.done ? 1 : 0, 'completato', '', '', '', '');
     if (s.hang && s.hang.skipped) r0('hangboard', 'hangboard', '', 0, 'saltato', '', '', '', s.hang.skipReason || '');
-    if (s.hang && !s.hang.skipped) {
+    if (s.hang && !s.hang.skipped && hangProtocol(s) === 'repeaters') {
+      const h = s.hang;
+      h.sets.forEach((x, i) => {
+        if (!x.done) return;
+        r0('hangboard', `repeaters ${h.onSec}/${h.offSec} ${h.grip}`, i + 1, setHeldReps(h, x), `rip/${h.repsPerSet}`,
+          round1(h.bodyKg + h.addedKg), h.edgeMm, x.rpe, h.interrupted ? 'interrotto: dolore' : '');
+      });
+    } else if (s.hang && !s.hang.skipped) {
       s.hang.reps.forEach((r, i) => {
         if (!r.done) return;
         r0('hangboard', `max hang ${s.hang.grip}`, i + 1, r.heldS ?? r.targetS, 's',

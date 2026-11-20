@@ -2,7 +2,7 @@
 // Service worker: salva in cache i file dell'app per l'uso offline.
 // Quando modifichi l'app, incrementa VERSION per forzare l'aggiornamento.
 // =====================================================================
-const VERSION = 'v5';
+const VERSION = 'v6';
 const CACHE = `scheda-arrampicata-${VERSION}`;
 const FILES = [
   './',

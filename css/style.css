@@ -134,6 +134,13 @@ textarea, input { font: inherit; user-select: text; }
 .mode-countdown .clock { color: var(--accent); }
 .mode-rest { background: #0c2238; }
 .mode-rest .clock { color: var(--blue); }
+.mode-rest .phase-word { color: var(--blue); }
+
+/* Repeaters: puntini delle ripetizioni della serie */
+.rep-dots { display: flex; justify-content: center; gap: 12px; margin: 18px 0 8px; }
+.rep-dots span { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--line); }
+.rep-dots span.done { background: var(--green); border-color: var(--green); }
+.rep-dots span.cur { border-color: var(--green); box-shadow: 0 0 0 4px rgba(47, 209, 122, .25); }
 
 .step-title { font-size: 28px; text-align: center; margin: 8px 0 4px; }
 .rep-label { color: var(--muted); font-size: 16px; text-align: center; margin-top: 6px; }
